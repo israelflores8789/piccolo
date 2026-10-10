@@ -50,6 +50,7 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - USE Google-style docstrings for **all** source code.
 - KEEP comments concise yet clear. Do NOT use numbered headers (e.g. "1." or "(1)" etc).
 - FOR module-level docstrings, ADD the name of the module to the start of the docstring (e.g. """my_module.py — ...).
+- EVERY applicable file, including ALL source code files, REQUIRES a license header consistent with Apache-2.0 standards.
 - Do NOT wrap lines when generating markdown text.
 - USE Keep a Changelog standards in `CHANGELOG.md`; preserve release heading and bullet formatting because `just release` and the GitHub release workflow extract release notes from it.
 

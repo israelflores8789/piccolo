@@ -6,10 +6,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 pytest := "uv run pytest"
 src_dir := "src"
+check_dirs := "src tests"
 
 install-dev:
     @echo "Installing development dependencies..."
-    @uv sync --all-groups
+    @uv sync --all-groups --all-extras
 
 test *args:
     {{pytest}} -v -s {{args}}
@@ -22,8 +23,8 @@ lint:
     set -u
     status=0
 
-    uv run ruff check {{src_dir}} || status=1
-    uv run ruff format --check {{src_dir}} || status=1
+    uv run ruff check {{check_dirs}} || status=1
+    uv run ruff format --check {{check_dirs}} || status=1
 
     exit "$status"
 
@@ -38,9 +39,9 @@ lint-yaml:
     exit "$status"
 
 lint-fix:
-    uv run ruff format {{src_dir}}
-    uv run ruff check --fix {{src_dir}}
-    uv run ruff format {{src_dir}}
+    uv run ruff format {{check_dirs}}
+    uv run ruff check --fix {{check_dirs}}
+    uv run ruff format {{check_dirs}}
 
 typecheck:
     uv run pyrefly check {{src_dir}}
@@ -56,7 +57,16 @@ build:
     uv build --no-sources
 
 check-dist: build
-    uvx --from twine twine check dist/*
+    uv run twine check --strict dist/*
+
+# Local command checks without cloud credentials or API requests.
+smoke:
+    uv run piccolo --help
+    uv run piccolo validate --config examples/gcp/piccolo.toml
+
+# Verify the wheel works without the optional GCP SDK dependencies.
+package-smoke:
+    uv run --isolated --no-project --with ./dist/piccolo-0.1.0-py3-none-any.whl piccolo validate --config examples/gcp/piccolo.toml
 
 clean:
     rm -rf dist/ build/ .pytest_cache/ .mypy_cache/ .ruff_cache/ .pyrefly/

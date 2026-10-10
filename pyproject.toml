@@ -9,20 +9,39 @@ build-backend = "hatchling.build"
 name = "piccolo"
 version = "0.1.0"
 description = "Declarative infrastructure utility for GCP development environments"
+readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-dependencies = []
+dependencies = ["typer>=0.16", "yaspin>=3.1"]
+
+[project.scripts]
+piccolo = "piccolo.cli:main"
+
+[project.optional-dependencies]
+gcp = [
+    "google-cloud-compute>=1.30",
+    "google-cloud-secret-manager>=2.20",
+    "google-cloud-resource-manager>=1.12",
+    "google-cloud-iam>=2.18",
+    "google-cloud-service-usage>=1.10",
+    "google-auth>=2.35",
+]
 
 [dependency-groups]
 dev = [
+    "build>=1.2",
     "pre-commit>=4.0",
     "pyrefly>=0.20",
     "pytest>=8.0",
     "ruff>=0.8",
+    "twine>=6.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/piccolo"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "README.md", "NEXTSTEPS.md", "CHANGELOG.md", "LICENSE", "pyproject.toml", "justfile", "uv.lock"]
 
 [tool.ruff]
 target-version = "py312"
