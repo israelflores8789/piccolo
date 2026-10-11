@@ -1,5 +1,7 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
+# For live testing purposes, this profile is a template for approved values.
+# It is not intended to be used directly.
 # Copy to .test_runs/approved.toml and fill in approved values before opting in.
 # This profile contains no bootstrap; the runner generates only a marker script.
 

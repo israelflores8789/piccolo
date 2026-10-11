@@ -1,0 +1,450 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Piccolo configuration",
+  "description": "Schema for piccolo.toml schema version 1. Piccolo also checks referenced files and cross-field constraints when loading the configuration.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "environment",
+    "gcp"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "default": 1,
+      "description": "Piccolo configuration schema version."
+    },
+    "environment": {
+      "$ref": "#/$defs/identifier",
+      "description": "Lowercase environment name."
+    },
+    "provider": {
+      "type": "string",
+      "const": "gcp",
+      "default": "gcp",
+      "description": "The only currently supported provider."
+    },
+    "gcp": {
+      "$ref": "#/$defs/gcp"
+    },
+    "bootstrap": {
+      "$ref": "#/$defs/bootstrap"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "gcp": {
+            "properties": {
+              "ssh": {
+                "not": {
+                  "properties": {
+                    "via_iap": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "via_iap"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gcp": {
+            "properties": {
+              "iap": {
+                "properties": {
+                  "ports": {
+                    "contains": {
+                      "const": 22
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      }
+    },
+    "gcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "project_id",
+        "instance",
+        "placement",
+        "disk",
+        "ssh"
+      ],
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]$",
+          "description": "Google Cloud project ID."
+        },
+        "auth": {
+          "$ref": "#/$defs/auth"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "placement": {
+          "$ref": "#/$defs/placement"
+        },
+        "disk": {
+          "$ref": "#/$defs/disk"
+        },
+        "network": {
+          "$ref": "#/$defs/network"
+        },
+        "iap": {
+          "$ref": "#/$defs/iap"
+        },
+        "iam": {
+          "$ref": "#/$defs/iam"
+        },
+        "enable_apis": {
+          "type": "boolean",
+          "default": false
+        },
+        "operation_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648,
+          "default": 600
+        },
+        "ssh": {
+          "$ref": "#/$defs/ssh"
+        },
+        "tunnel": {
+          "$ref": "#/$defs/tunnel"
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "adc",
+            "file"
+          ],
+          "default": "adc"
+        },
+        "credential_file": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a credentials file, relative to piccolo.toml. Required when mode is file; the file must exist."
+        },
+        "impersonate_service_account": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "credential_file": {
+                "minLength": 1
+              }
+            },
+            "required": [
+              "credential_file"
+            ]
+          },
+          "else": {
+            "properties": {
+              "credential_file": {
+                "maxLength": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "service_account"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_type": {
+          "$ref": "#/$defs/identifier",
+          "default": "n2-standard-4"
+        },
+        "service_account": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]+\\.iam\\.gserviceaccount\\.com$",
+          "description": "Service account email. If gcp.iam.create_service_account is true, its project portion must match gcp.project_id."
+        }
+      }
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zones"
+      ],
+      "properties": {
+        "zones": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z]+-[a-z]+[0-9]+-[a-z]$"
+          }
+        },
+        "snapshot_location": {
+          "$ref": "#/$defs/identifier",
+          "default": "us"
+        }
+      }
+    },
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image"
+      ],
+      "properties": {
+        "size_gb": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 30
+        },
+        "type": {
+          "$ref": "#/$defs/identifier",
+          "default": "pd-standard"
+        },
+        "image": {
+          "type": "string",
+          "pattern": "^projects/[a-z0-9-]+/global/images/[a-z0-9-]+$"
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier",
+          "default": "default"
+        },
+        "subnet": {
+          "$ref": "#/$defs/identifier",
+          "default": "default"
+        },
+        "subnets": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/identifier"
+          },
+          "default": {}
+        },
+        "external_ip": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "iap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "firewall_name": {
+          "$ref": "#/$defs/identifier",
+          "description": "Defaults to the environment name followed by -iap."
+        },
+        "ports": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "default": [
+            22,
+            8080
+          ],
+          "description": "When SSH via IAP is enabled, must include port 22 and gcp.tunnel.remote_port."
+        },
+        "source_ranges": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:[0-9]|[12][0-9]|3[0-2])$"
+          },
+          "default": [
+            "35.235.240.0/20"
+          ],
+          "description": "IPv4 CIDR ranges. Piccolo also verifies that each address is a canonical network address."
+        }
+      }
+    },
+    "iam": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create_service_account": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, gcp.instance.service_account must belong to gcp.project_id."
+        },
+        "secrets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "default": []
+        },
+        "project_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?:roles/[A-Za-z0-9_.]+|projects/[a-z0-9-]+/roles/[A-Za-z0-9_.]+)$"
+          },
+          "default": []
+        }
+      }
+    },
+    "ssh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user"
+      ],
+      "properties": {
+        "user": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]{0,31}$"
+        },
+        "via_iap": {
+          "type": "boolean",
+          "default": true
+        },
+        "account": {
+          "type": "string",
+          "default": ""
+        },
+        "impersonate_service_account": {
+          "type": "string",
+          "default": ""
+        },
+        "readiness_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648,
+          "default": 300
+        },
+        "readiness_command": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "tunnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "remote_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8080
+        },
+        "local_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8080
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "script",
+        "execution_user"
+      ],
+      "properties": {
+        "script": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "Path to an existing script, relative to piccolo.toml."
+        },
+        "remote_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!\\.$)[A-Za-z0-9_./-]+$",
+          "default": ".piccolo/bootstrap/setup.sh"
+        },
+        "execution_user": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Must equal gcp.ssh.user."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648,
+          "default": 1800
+        }
+      }
+    }
+  }
+}
