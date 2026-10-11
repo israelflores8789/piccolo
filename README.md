@@ -91,6 +91,10 @@ The IAP firewall targets the configured VM service account. Use a dedicated VM a
 
 SDK authentication resolves once per invocation with cloud-platform scopes and passes those credentials to every SDK client. The configured project always selects the target, regardless of credential discovery. For SDK file or impersonation credentials, connection commands require an explicit `gcp.ssh.account` or `gcp.ssh.impersonate_service_account`. Piccolo reports the selected `gcloud` identity separately; it cannot infer that independently configured ADC and `gcloud` logins are identical.
 
+SDK credential files must be operator-controlled Google `service_account` or `authorized_user` JSON. Piccolo validates the type, Google OAuth token endpoint, and `googleapis.com` universe before using a type-specific loader. This policy also applies to `GOOGLE_APPLICATION_CREDENTIALS` and the well-known gcloud ADC file. External-account/federation, GDCH, and embedded impersonation credential JSON are unsupported; use `gcp.auth.impersonate_service_account` with a supported source. Without a local ADC file, SDK authentication uses Google metadata credentials. `validate` checks TOML and referenced paths; credential validation happens before SDK construction. TOML, credentials, readiness commands, and bootstrap scripts must come from trusted operators.
+
+Every gcloud transport checks inherited authentication overrides and active configuration properties before proceeding, including SCP and bootstrap receipt reads. Unset `CLOUDSDK_AUTH_ACCESS_TOKEN`, `CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`, `CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`, `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`, and `CLOUDSDK_AUTH_DISABLE_CREDENTIALS`. Persisted `auth/access_token_file`, `auth/credential_file_override`, `auth/impersonate_service_account`, and enabled `auth/disable_credentials` also block connections. Configure intended connection impersonation explicitly in TOML; Piccolo reports both the source account and target.
+
 ## Commands
 
 | Command | Behavior |
@@ -98,6 +102,7 @@ SDK authentication resolves once per invocation with cloud-platform scopes and p
 | `validate` | Validate local TOML and referenced files without cloud access |
 | `plan` | Inspect VM drift, API enablement, service-account state, missing unconditional IAM grants, and firewall reconciliation; no cloud writes |
 | `init` | Ensure required APIs, account, additive grants, and firewall; create a fresh VM if absent and stage its script; never execute bootstrap |
+| `init --adopt` | Adopt a reviewed legacy VM without Piccolo ownership labels, recording its immutable ID before access reconciliation; no bootstrap eligibility |
 | `bootstrap --dry-run` | Show script, execution identity, staging state, and eligibility without invoking setup |
 | `bootstrap` | Explicitly authorize and launch the first staged-script attempt on its recorded fresh disk |
 | `bootstrap --status` | Read local history and the guest's execution receipt without authorizing another attempt |
@@ -135,6 +140,8 @@ piccolo connect
 
 Repeated `init` inspects the existing boot disk and VM. Differences in managed machine type, service account, image, disk size/type, or networking produce an explicit report; Piccolo has no automatic rebuild/update policy. An existing environment with missing state has unknown bootstrap history and cannot become eligible merely by running `init`.
 
+VMs positively labeled for another Piccolo environment are rejected before lifecycle, access, or connection work, including when `--adopt` is supplied. An unrecorded legacy VM requires deliberate `init --adopt` after reviewing its settings and automatic guest hooks. Adoption binds the immutable instance ID locally and preserves its existing disk and labels. Local locks also serialize configurations selecting the same project/VM name within one state root.
+
 ## Bootstrap safety
 
 On fresh provisioning, Piccolo records the boot disk's immutable cloud ID, copies the script through the configured development user's SSH session, verifies SHA-256, and stores the artifact's path, digest, and user. It does not attach script metadata, modify startup hooks, or execute setup. Repeated `init` never copies a replacement script onto an existing environment.
@@ -143,7 +150,7 @@ On fresh provisioning, Piccolo records the boot disk's immutable cloud ID, copie
 
 Moving a disk preserves the staged artifact and guest receipt. It does not grant bootstrap eligibility to the replacement disk. A running or uncertain bootstrap attempt blocks a move until its status is resolved. Guest utilities required for staging/execution are Bash, `sha256sum`, `cut`, `mkdir`, `chmod`, `mv`, `rm`, `cat`, and `nohup`; the image must have a functioning SSH server and Google guest environment. Bootstrap-specific dependencies remain the project's responsibility.
 
-Piccolo rejects known instance and project startup metadata before creating, starting, or moving VMs. Existing guest services, cron jobs, and arbitrary hooks installed by an image or a project script remain outside Piccolo's knowledge. Review those hooks before adopting an existing environment; opaque scripts can install their own automatic behavior.
+Piccolo rejects known instance and project startup/shutdown metadata, including script URLs, sysprep, and user-data, before lifecycle and access mutations. Stop, resumed power operations, and retired-source deletion recheck these guards. Existing guest services, cron jobs, and arbitrary hooks installed by an image or a project script remain outside Piccolo's knowledge. Review those hooks before adopting an existing environment; opaque scripts can install their own automatic behavior.
 
 ## Relocation and recovery
 
@@ -157,7 +164,7 @@ Exactly one VM is selected by daily commands. Source/replacement overlap is expe
 
 Local state defaults to `~/.piccolo/PROJECT_ENVIRONMENT_HASH/state.json`; `PICCOLO_STATE_DIR` can override the root. Files use atomic replacement, flushes, and operation history. Mutation locks are kernel-held and release on process exit on Linux/macOS and Windows. Keep state on one durable workstation: local locks do not coordinate independent machines. Back up this directory; missing history blocks setup rather than authorizing it. An unresolved operation requires the original TOML bytes, including comments, before `resume`; restore the original config if it changed. If an operation is no longer queryable, preserve state and cloud resources for manual inspection.
 
-Cleanup is deliberately narrower than environment destruction. It requires environment/operation ownership labels and immutable IDs, excludes attached disks, protects all environment artifacts while any operation is unresolved, and rechecks each target before deletion. It never revokes additive IAM grants, deletes accounts/networks, or removes the active VM/firewall. Do not use it as a live-test teardown substitute.
+Cleanup is deliberately narrower than environment destruction. It requires environment/operation ownership labels, an exact artifact manifest in positively completed init/move history, immutable IDs, settled cloud operation results, and an unambiguous recorded active VM. It excludes attached disks, protects all environment artifacts while any operation is unresolved, and rechecks history, topology, IDs, and attachments before deletion. Missing state, unknown operations, old history without artifact manifests, or expired/unavailable Compute operations retain artifacts for manual recovery; `init` does not authorize their deletion. It never revokes additive IAM grants, deletes accounts/networks, or removes the active VM/firewall. Do not use it as a live-test teardown substitute.
 
 ## Providers and package layout
 
@@ -222,7 +229,7 @@ For CI or shell-only use, supply the variable directly: `PICCOLO_GCP_LIVE_PROJEC
 
 The recipe streams output to `.test_logs/pytest-gcp-live.log`, preserves pytest's exit status, and retains per-run `.test_runs/plive-RUN/` directories containing generated sanitized TOML, harmless marker script, isolated Piccolo state, baseline inventory/API state, and `manifest.json`. Credentials and secret payloads are not logged. Keep these files for recovery and evidence.
 
-Live assertions cover repeated-init identities, explicit bootstrap and repeat/change/missing-history guards, sentinel hashes across regions, security/account/subnet preservation, cleanup previews, human SSH/IAP traffic, and tunnel interruption. Failed/uncertain bootstrap launches and interrupted relocation stages remain deterministic offline checks. Windows/Git Bash outcomes, IAM propagation, and actual spend still require authorized live validation.
+Live assertions cover repeated-init identities, explicit bootstrap and repeat/change/missing-history guards, sentinel hashes across regions, security/account/subnet preservation, cleanup previews, human SSH/IAP traffic, and tunnel interruption. H01 through H06 regressions add real gcloud override parsing, invalid credential rejection before SDK construction, injected interruptions after genuine later-zone acceptance, preservation of an unresolved move snapshot under a fresh state root, foreign-environment rejection, and harmless instance shutdown-hook checks. Project shutdown metadata is tested through a read overlay. Move fallback requires three approved zones and reports a skip with fewer; init fallback requires two. Failed/uncertain bootstrap launches remain deterministic offline checks. These live cases are implemented but have not been executed; Windows/Git Bash outcomes, IAM propagation, and actual spend still require authorized live validation.
 
 Fixture teardown runs in `finally`, including ordinary interruption and setup/assertion failures. It reconciles persisted requests before deleting dependencies, removes proven run-owned VMs, checks disk identities/detachments, then removes disks/snapshots/firewalls, added IAM members, dummy secrets, and created accounts. Unknown creates without observable operations are retained rather than retried or declared absent. Cleanup refuses changed IDs, untracked attachments, auto-delete disks, foreign ownership, and unsafe IAM targets. Prefix inventory detects strays but never authorizes deletion by prefix alone. Unresolved operations, failed deletions, and incomplete inventories fail teardown; leftovers may continue to incur costs.
 

@@ -261,13 +261,6 @@ def preflight(
     for zone in config.gcp.zones:
         cloud.subnet(zone)
     connection.check_identity()
-    impersonation = connection.run(
-        ["config", "get-value", "auth/impersonate_service_account"]
-    )
-    if impersonation.returncode or impersonation.stdout.strip() not in {"", "(unset)"}:
-        raise PiccoloError(
-            "Unset gcloud auth/impersonate_service_account for human connections"
-        )
     with socket.socket() as local:
         try:
             local.bind(("127.0.0.1", config.gcp.local_port))

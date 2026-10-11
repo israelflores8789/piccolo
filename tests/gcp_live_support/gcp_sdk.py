@@ -15,7 +15,7 @@ from google.iam.v1 import iam_policy_pb2, options_pb2, policy_pb2
 from gcp_live_support.manifest import Manifest, gate
 from piccolo.config.models import Config
 from piccolo.data import Document, decode, document, objects, text
-from piccolo.errors import PiccoloError
+from piccolo.errors import PiccoloError, UncertainError
 from piccolo.providers.gcp.access import Access, add_binding
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.operations import failure
@@ -145,6 +145,46 @@ class LiveCloud(SDKCloud):
             elif observed.get(key) != expected:
                 return False
         return True
+
+    def set_metadata(self, zone: str, instance_id: str, items: list[Document]) -> None:
+        """Journal harmless metadata regression writes to an exact run-owned VM."""
+        gate(self.project)
+        name = self.config.gcp.name
+        observed = self.get("instance", name, zone)
+        entry = self.manifest.lookup("instance", name, zone)
+        if (
+            observed is None
+            or entry is None
+            or not self.owns(entry, observed)
+            or text(observed, "id") != instance_id
+        ):
+            raise PiccoloError("Refusing metadata changes to an unproven run VM")
+        metadata = document(observed.get("metadata", {}))
+        action = self.manifest.intent("instance.metadata", name, zone)
+        request = compute_v1.SetMetadataInstanceRequest(
+            project=self.project,
+            zone=zone,
+            instance=name,
+            request_id=text(action, "key"),
+            metadata_resource=compute_v1.Metadata(
+                fingerprint=text(metadata, "fingerprint"),
+                items=items,
+            ),
+        )
+        operation = self.perform(
+            action,
+            lambda: self.clients.instances.set_metadata(
+                request=request,
+                retry=None,
+                timeout=30,
+            ),
+        )
+        action["operation"] = operation.name
+        self.manifest.put("actions", action)
+        if not self.settle(action):
+            raise UncertainError("Live metadata write remains unresolved")
+        if text(action, "error"):
+            raise PiccoloError("Live metadata regression write failed")
 
     def preserve_external(self, kind: str, name: str) -> None:
         """Track an approved existing policy target without authorizing deletion."""

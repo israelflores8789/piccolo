@@ -5,6 +5,7 @@
 
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated
 
@@ -66,6 +67,7 @@ def invoke(
     status: bool = False,
     destination: str | None = None,
     rollback: bool = False,
+    adopt: bool = False,
 ) -> None:
     """Dispatch commands through provider contracts with local mutation locks."""
     try:
@@ -100,15 +102,16 @@ def invoke(
                     yaspin(
                         text=f"Piccolo {action}",
                         stream=sys.stderr,
-                        disable=not sys.stderr.isatty(),
-                    ),
+                    )
+                    if sys.stderr.isatty()
+                    else nullcontext(),
                 ):
                     provider = create(config)
                     if action not in provider.capabilities:
                         raise PiccoloError(f"Provider does not support {action}")
                     match action:
                         case "init":
-                            provider.init()
+                            provider.init(adopt=adopt)
                         case "start":
                             provider.start()
                         case "stop":
@@ -168,9 +171,12 @@ def init(
             "--config", "-c", help="Configuration path; defaults to ./piccolo.toml."
         ),
     ] = None,
+    adopt: Annotated[
+        bool, typer.Option(help="Adopt a reviewed unlabeled legacy VM by immutable ID.")
+    ] = False,
 ) -> None:
     """Provision infrastructure and stage a script without executing bootstrap."""
-    invoke(ctx, config, "init")
+    invoke(ctx, config, "init", adopt=adopt)
 
 
 @app.command()

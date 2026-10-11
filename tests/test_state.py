@@ -6,6 +6,7 @@
 import os
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -49,3 +50,15 @@ def test_lock_blocks_other_process_and_releases(config: Config) -> None:
         command, capture_output=True, text=True, check=False, env=os.environ.copy()
     )
     assert result.returncode == 0
+
+
+def test_different_environments_share_vm_resource_lock(config: Config) -> None:
+    other = replace(config, environment="other-env")
+    with (
+        environment_lock(config),
+        pytest.raises(PiccoloError, match="environment lock"),
+        environment_lock(other),
+    ):
+        pytest.fail("Same VM was locked by another environment")
+    with environment_lock(other):
+        pass

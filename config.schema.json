@@ -161,7 +161,7 @@
         "credential_file": {
           "type": "string",
           "default": "",
-          "description": "Path to a credentials file, relative to piccolo.toml. Required when mode is file; the file must exist."
+          "description": "Path to a user-controlled Google service_account or authorized_user JSON file, relative to piccolo.toml. Required when mode is file; the file must exist. SDK loading validates credential type, Google OAuth token endpoint, and googleapis.com universe; external-account and embedded impersonation JSON are unsupported."
         },
         "impersonate_service_account": {
           "type": "string",

@@ -3,9 +3,11 @@
 
 """lock.py — Kernel-released environment locks for Linux, macOS, and Windows."""
 
+import hashlib
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 
 from piccolo.config.models import Config
 from piccolo.errors import PiccoloError
@@ -14,10 +16,22 @@ from piccolo.state.journal import state_directory
 
 @contextmanager
 def environment_lock(config: Config) -> Generator[None]:
-    """Serialize local mutations and release automatically after process exit."""
+    """Serialize environment and same-name VM mutations within one state root."""
     directory = state_directory(config)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (directory / "lock").open("a+b") as stream:
+    identity = f"{config.provider}:{config.gcp.project_id}:{config.gcp.name}"
+    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    with (
+        file_lock(directory / "lock"),
+        file_lock(directory.parent / f"resource-{key}.lock"),
+    ):
+        yield
+
+
+@contextmanager
+def file_lock(path: Path) -> Generator[None]:
+    """Hold one nonblocking kernel lock and release it on every exit path."""
+    with path.open("a+b") as stream:
         stream.seek(0, os.SEEK_END)
         if stream.tell() == 0:
             stream.write(b"\0")

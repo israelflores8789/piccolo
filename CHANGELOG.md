@@ -19,8 +19,17 @@ All notable changes to this project will be documented in this file. The format 
 - Explicitly gated GCP lifecycle and human IAP tests for the Piccolo GCP project, durable run manifests, an independent scoped janitor, and offline interruption/cleanup safety tests.
 - Configurable live-test project approval through `PICCOLO_GCP_LIVE_PROJECT`, explicit dotenv loading, and manifests that retain their original project for recovery.
 - Scoped live grants on approved existing secrets, conditional account-creation permission checks, and guest verification of dummy secret access.
+- Local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions remediating H01 and H06 of the 2026-10-11 security audit.
 
 ### Fixed
+
+- Reject inherited and persisted gcloud authentication overrides on all connection paths, including receipt reads and live tunnels.
+- Validate supported SDK credential JSON before type-specific loading, including environment and well-known ADC files.
+- Resume accepted creations in later capacity-fallback zones without duplicate submissions.
+- Retain recovery artifacts unless completed operation history positively authorizes cleanup.
+- Reject VM ownership from another environment before access or lifecycle mutations.
+- Block automatic shutdown metadata before stop, relocation, resumed power operations, and retired-source deletion.
+- Correct noninteractive CLI spinner handling so mutating commands, including legacy adoption, reach their provider.
 
 - Accept direct provisioner credentials in live profiles, test human-source impersonation separately, and use the authenticated provisioner for temporary attachment grants.
 - Check local gcloud and OpenSSH prerequisites before live provisioning.

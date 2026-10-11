@@ -6,11 +6,13 @@
 from pathlib import Path
 
 import pytest
+from conftest import FakeCloud, GuestConnection
 from typer.testing import CliRunner
 
 from piccolo.cli import app
-from piccolo.config import load
+from piccolo.config import Config, load
 from piccolo.errors import PiccoloError
+from piccolo.providers.gcp.provider import GCPProvider
 
 
 def test_current_directory_only(
@@ -89,3 +91,25 @@ def test_conflicting_options(config_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert "Conflicting" in result.output
+
+
+def test_init_adoption_flag_is_explicit(
+    config: Config,
+    cloud: FakeCloud,
+    connection: GuestConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = GCPProvider(config, cloud, connection)
+    provider.init()
+    provider.journal.path.unlink()
+    cloud.resources[("instance", "test-vm", "us-west1-a")]["labels"] = {}
+    monkeypatch.setattr(
+        "piccolo.cli.create", lambda selected: GCPProvider(selected, cloud, connection)
+    )
+    result = CliRunner().invoke(app, ["init", "-c", str(config.path)])
+    assert result.exit_code == 1
+    assert "init --adopt" in result.output
+    result = CliRunner().invoke(app, ["init", "--adopt", "-c", str(config.path)])
+    assert result.exit_code == 0, result.output
+    adopted = GCPProvider(config, cloud, connection)
+    assert adopted.journal.data["active_instance_id"] == adopted.active()["id"]

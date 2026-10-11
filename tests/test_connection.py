@@ -3,6 +3,7 @@
 
 """test_connection.py — Transport identity, retries, and subprocess construction."""
 
+import json
 import subprocess
 import sys
 from dataclasses import replace
@@ -13,7 +14,7 @@ import pytest
 
 from piccolo.config import Config
 from piccolo.errors import PiccoloError
-from piccolo.providers.gcp.connection import GCloudConnection
+from piccolo.providers.gcp.connection import AUTH_OVERRIDES, GCloudConnection
 
 
 def test_connection_uses_configured_user_project_and_iap(config: Config) -> None:
@@ -30,9 +31,16 @@ def test_shell_is_foreground_and_no_local_shell_interpolation(
 ) -> None:
     connection = GCloudConnection(config.gcp)
     monkeypatch.setattr(connection, "executable", lambda: "/sdk with spaces/gcloud")
-    mocked = Mock(return_value=subprocess.CompletedProcess(["gcloud"], 0, "", ""))
+    connection.identity_checked = True
+    mocked = Mock(
+        side_effect=[
+            subprocess.CompletedProcess(["gcloud"], 0, "{}", ""),
+            subprocess.CompletedProcess(["gcloud"], 0, "", ""),
+        ]
+    )
     monkeypatch.setattr(subprocess, "run", mocked)
-    monkeypatch.setenv("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "unrelated-key.json")
+    for variable in AUTH_OVERRIDES:
+        monkeypatch.delenv(variable, raising=False)
     connection.shell("us-west1-a")
     arguments = mocked.call_args
     assert arguments.args[0][0] == "/sdk with spaces/gcloud"
@@ -40,6 +48,85 @@ def test_shell_is_foreground_and_no_local_shell_interpolation(
     assert arguments.kwargs["capture_output"] is False
     assert arguments.kwargs["timeout"] is None
     assert "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" not in arguments.kwargs["env"]
+
+
+@pytest.mark.parametrize("variable", AUTH_OVERRIDES)
+@pytest.mark.parametrize("command", ["ssh", "scp", "start-iap-tunnel"])
+def test_inherited_auth_override_blocks_every_transport(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    command: str,
+) -> None:
+    connection = GCloudConnection(
+        replace(config.gcp, connection_account="human@example.com")
+    )
+    mocked = Mock()
+    monkeypatch.setattr(subprocess, "run", mocked)
+    monkeypatch.setenv(variable, "private-value-must-not-be-printed")
+    with pytest.raises(PiccoloError, match=variable) as caught:
+        connection.run(["compute", command])
+    assert "private-value" not in str(caught.value)
+    mocked.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    [
+        "access_token_file",
+        "credential_file_override",
+        "impersonate_service_account",
+        "disable_credentials",
+    ],
+)
+def test_persisted_auth_override_blocks_receipt_and_transfer(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    property_name: str,
+) -> None:
+    connection = GCloudConnection(config.gcp)
+    connection.identity_checked = True
+    monkeypatch.setattr(connection, "executable", lambda: "gcloud")
+    for variable in AUTH_OVERRIDES:
+        monkeypatch.delenv(variable, raising=False)
+    mocked = Mock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps({"auth": {property_name: "private-value"}}), ""
+        )
+    )
+    monkeypatch.setattr(subprocess, "run", mocked)
+    with pytest.raises(PiccoloError, match=property_name):
+        connection.execute("us-west1-a", "cat receipt")
+    assert mocked.call_count == 1
+    assert "config" in mocked.call_args.args[0]
+
+
+def test_receipt_read_selects_identity_without_readiness(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = GCloudConnection(config.gcp)
+    monkeypatch.setattr(connection, "executable", lambda: "gcloud")
+    for variable in AUTH_OVERRIDES:
+        monkeypatch.delenv(variable, raising=False)
+
+    def response(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        stdout = (
+            "{}" if "config" in args else "human@example.com" if "auth" in args else "0"
+        )
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    mocked = Mock(side_effect=response)
+    monkeypatch.setattr(subprocess, "run", mocked)
+    assert connection.execute("us-west1-a", "cat receipt") == "0"
+    assert "--account=human@example.com" in mocked.call_args.args[0]
+    monkeypatch.setenv("CLOUDSDK_AUTH_ACCESS_TOKEN", "changed-after-check")
+    count = mocked.call_count
+    with pytest.raises(PiccoloError, match="CLOUDSDK_AUTH_ACCESS_TOKEN"):
+        connection.execute("us-west1-a", "cat receipt")
+    assert mocked.call_count == count
 
 
 def test_readiness_retries_then_succeeds(

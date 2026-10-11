@@ -14,7 +14,7 @@ from piccolo.providers.base import Connection
 from piccolo.providers.gcp.auth import credentials
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.connection import GCloudConnection
-from piccolo.providers.gcp.operations import Cloud, Operations
+from piccolo.providers.gcp.operations import Cloud, Operations, failure
 from piccolo.providers.gcp.provision import (
     boot_disk,
     differences,
@@ -92,13 +92,25 @@ class GCPProvider:
                 f"inspect duplicates"
             )
         selected = instances[0]
+        self.check_owner(selected)
         recorded = text(self.journal.data, "active_instance_id")
         if recorded and text(selected, "id") != recorded:
             raise PiccoloError(
                 "Instance identity changed outside Piccolo; "
                 "inspect state before continuing"
             )
+        if not recorded and not owned(self.config, selected):
+            raise PiccoloError("Unrecorded legacy VM; review it and run init --adopt")
         return selected
+
+    def check_owner(self, instance: Document) -> None:
+        """Reject positive foreign ownership even when a local ID matches."""
+        actual = document(instance.get("labels", {}))
+        owner = text(actual, "piccolo-environment")
+        if (owner and owner != text(labels(self.config), "piccolo-environment")) or (
+            actual.get("managed-by") == "piccolo" and not owner
+        ):
+            raise PiccoloError("VM has foreign or incomplete Piccolo ownership")
 
     def disk(self, instance: Document) -> Document:
         """Inspect the disk identified by the attached boot flag."""
@@ -152,11 +164,12 @@ class GCPProvider:
         }
 
     def safe_start(self, instance: Document) -> None:
-        """Reject instance and inherited startup metadata before a guest can boot."""
+        """Check ownership and both metadata scopes before lifecycle mutations."""
+        self.check_owner(instance)
         reject_startup(document(instance.get("metadata", {})))
         reject_startup(self.cloud.project_metadata())
 
-    def init(self) -> None:
+    def init(self, *, adopt: bool = False) -> None:
         """Reconcile an existing VM or journal fresh provisioning and script staging."""
         if self.journal.operation:
             raise PiccoloError("An unresolved operation exists; use resume")
@@ -170,7 +183,12 @@ class GCPProvider:
             )
         if instances:
             instance = instances[0]
+            self.check_owner(instance)
             recorded_id = text(self.journal.data, "active_instance_id")
+            if not owned(self.config, instance) and not recorded_id and not adopt:
+                raise PiccoloError(
+                    "Unrecorded legacy VM; review it and run init --adopt"
+                )
             if recorded_id and text(instance, "id") != recorded_id:
                 raise PiccoloError("Existing VM identity changed; inspect state")
             drift = differences(self.config, instance, self.disk(instance))
@@ -180,8 +198,18 @@ class GCPProvider:
                 raise PiccoloError(
                     "Existing VM differs; init will not rebuild it: " + "; ".join(drift)
                 )
+            self.safe_start(instance)
+            self.journal.data["active_instance_id"] = text(instance, "id")
+            self.journal.data["active_zone"] = zone_of(instance)
             self.journal.begin(
-                {"kind": "access", "id": uuid.uuid4().hex, "stage": "access"}
+                {
+                    "kind": "access",
+                    "id": uuid.uuid4().hex,
+                    "stage": "access",
+                    "instance_id": text(instance, "id"),
+                    "zone": zone_of(instance),
+                    "adopted": adopt and not owned(self.config, instance),
+                }
             )
             self.cloud.access()
             self.journal.finish()
@@ -189,6 +217,8 @@ class GCPProvider:
                 "Existing infrastructure verified; bootstrap was not staged or executed"
             )
             return
+        if adopt:
+            raise PiccoloError("init --adopt requires an existing VM")
         reject_startup(self.cloud.project_metadata())
         self.journal.begin(
             {
@@ -202,6 +232,8 @@ class GCPProvider:
 
     def access(self) -> None:
         """Persist access intent and repeat additive reconciliation safely."""
+        for instance in self.instances():
+            self.check_owner(instance)
         operation = self.journal.operation
         operation["stage"] = "access"
         self.journal.update(operation)
@@ -213,9 +245,24 @@ class GCPProvider:
         existing = self.cloud.get(kind, name, zone)
         if existing and not owned(self.config, existing, text(operation, "id")):
             raise PiccoloError(f"{kind} {name} already exists with different ownership")
+        recorded = next(
+            (
+                item
+                for item in objects(operation, "artifacts")
+                if item.get("kind") == kind
+                and item.get("name") == name
+                and item.get("zone") == zone
+            ),
+            None,
+        )
+        if recorded is not None and (
+            existing is None or text(existing, "id") != text(recorded, "id")
+        ):
+            raise PiccoloError("Created artifact identity changed; retained")
         self.operations.run(
             f"{kind}.insert:{zone}:{name}", f"{kind}.insert", name, zone, resource
         )
+        operation = self.journal.operation
         observed = self.cloud.get(kind, name, zone)
         if observed is None or not owned(self.config, observed, text(operation, "id")):
             raise PiccoloError(
@@ -227,6 +274,31 @@ class GCPProvider:
             raise PiccoloError(
                 f"{kind} {name} is not {expected}; run resume after inspection"
             )
+        if kind in {"disk", "snapshot", "instance"}:
+            artifacts = objects(operation, "artifacts")
+            entry: Document = {
+                "kind": kind,
+                "name": name,
+                "zone": zone,
+                "id": text(observed, "id"),
+                "operation_id": text(operation, "id"),
+            }
+            previous = next(
+                (
+                    item
+                    for item in artifacts
+                    if item["kind"] == kind
+                    and item["name"] == name
+                    and item["zone"] == zone
+                ),
+                None,
+            )
+            if previous is not None and previous != entry:
+                raise PiccoloError("Created artifact identity changed; retained")
+            if previous is None:
+                artifacts.append(entry)
+                operation["artifacts"] = [item for item in artifacts]
+                self.journal.update(operation)
         return observed
 
     def candidate(
@@ -272,8 +344,25 @@ class GCPProvider:
             raise PiccoloError("Invalid journal zone policy")
         source_zone = zone_of(source) if source else ""
         for candidate_zone in zones:
+            operation = self.journal.operation
             if not isinstance(candidate_zone, str):
                 raise PiccoloError("Invalid journal candidate zone")
+            failed = any(
+                text(action, "zone") == candidate_zone
+                and text(action, "kind") in {"disk.insert", "instance.insert"}
+                and text(action, "status") == "failed"
+                and action.get("capacity") is True
+                for action in objects(operation, "actions")
+            )
+            if failed:
+                if (
+                    self.cloud.get("instance", self.gcp.name, candidate_zone)
+                    is not None
+                ):
+                    raise PiccoloError("Capacity failure left a VM resource; inspect")
+                continue
+            operation["candidate_zone"] = candidate_zone
+            self.journal.update(operation)
             self.notify(f"Trying {candidate_zone}")
             current = self.instances()
             if any(
@@ -358,6 +447,7 @@ class GCPProvider:
     def stop(self) -> None:
         """Stop an existing VM without touching its disk or setup."""
         instance = self.active()
+        self.safe_start(instance)
         if text(instance, "status") == "TERMINATED":
             return
         if text(instance, "status") != "RUNNING":
@@ -381,8 +471,7 @@ class GCPProvider:
         instance = self.cloud.get("instance", self.gcp.name, zone)
         if instance is None or text(instance, "id") != text(operation, "instance_id"):
             raise PiccoloError("Power-operation target identity changed")
-        if kind == "start":
-            self.safe_start(instance)
+        self.safe_start(instance)
         self.operations.run(kind, f"instance.{kind}", self.gcp.name, zone)
         observed = self.cloud.get("instance", self.gcp.name, zone)
         expected = "RUNNING" if kind == "start" else "TERMINATED"
@@ -439,6 +528,8 @@ class GCPProvider:
             raise PiccoloError(
                 "Source instance identity changed; move recovery is blocked"
             )
+        if source is not None:
+            self.check_owner(source)
         return source
 
     def continue_move(self) -> None:
@@ -509,6 +600,7 @@ class GCPProvider:
             or text(verified, "status") != "RUNNING"
         ):
             raise PiccoloError("Replacement changed during readiness verification")
+        self.check_owner(verified)
         operation["committed"] = True
         operation["stage"] = "committed"
         self.journal.data["active_instance_id"] = text(replacement, "id")
@@ -531,10 +623,12 @@ class GCPProvider:
                 "Committed replacement is missing or stopped; "
                 "recovery resources retained"
             )
+        self.check_owner(replacement)
         source = self.source()
         source_record = document(operation["source"])
         zone = zone_of(source_record)
         if source:
+            self.safe_start(source)
             if (
                 text(source, "status") != "TERMINATED"
                 or boot_disk(source).get("auto_delete") is not False
@@ -580,6 +674,14 @@ class GCPProvider:
             case "start" | "stop":
                 self.continue_power()
             case "access":
+                target = self.cloud.get(
+                    "instance", self.gcp.name, text(self.journal.operation, "zone")
+                )
+                if target is None or text(target, "id") != text(
+                    self.journal.operation, "instance_id"
+                ):
+                    raise PiccoloError("Access target identity changed; retained")
+                self.safe_start(target)
                 self.cloud.access()
                 self.journal.finish()
             case "cleanup":
@@ -626,7 +728,7 @@ class GCPProvider:
         )
 
     def cleanup(self, apply: bool) -> Document:
-        """Preview owned artifacts while protecting unresolved moves."""
+        """Require completed local manifests before making artifacts eligible."""
         resources = [*self.cloud.list("disk"), *self.cloud.list("snapshot")]
         eligible: list[Value] = []
         protected: list[Value] = []
@@ -643,7 +745,11 @@ class GCPProvider:
                 "id": text(item, "id"),
                 "operation_id": text(document(item["labels"]), "piccolo-operation"),
             }
-            if item.get("users") or self.journal.operation:
+            if (
+                item.get("users")
+                or self.journal.operation
+                or not self.cleanup_authorized(entry)
+            ):
                 protected.append(entry)
             else:
                 eligible.append(entry)
@@ -663,6 +769,52 @@ class GCPProvider:
             self.continue_cleanup()
         return result
 
+    def cleanup_authorized(self, entry: Document) -> bool:
+        """Verify exact history, settled cloud requests, and environment topology."""
+        if not text(entry, "id") or not text(entry, "operation_id"):
+            return False
+        origin = next(
+            (
+                item
+                for item in objects(self.journal.data, "history")
+                if text(item, "id") == text(entry, "operation_id")
+            ),
+            None,
+        )
+        if (
+            origin is None
+            or text(origin, "stage") != "complete"
+            or text(origin, "kind") not in {"init", "move"}
+            or entry not in objects(origin, "artifacts")
+        ):
+            return False
+        current = self.instances()
+        if len(current) != 1 or text(current[0], "id") != text(
+            self.journal.data, "active_instance_id"
+        ):
+            return False
+        self.check_owner(current[0])
+        for instance in self.cloud.list("instance"):
+            for disk in objects(instance, "disks"):
+                source = text(disk, "source")
+                if text(entry, "kind") == "disk" and source.endswith(
+                    f"/zones/{text(entry, 'zone')}/disks/{text(entry, 'name')}"
+                ):
+                    return False
+        actions = objects(origin, "actions")
+        if not actions:
+            return False
+        for action in actions:
+            status, operation_id = text(action, "status"), text(action, "operation_id")
+            if status not in {"done", "failed"} or not operation_id:
+                return False
+            result = self.cloud.poll(operation_id, text(action, "zone"))
+            if text(result, "status") != "DONE":
+                return False
+            if (failure(result) is None) != (status == "done"):
+                return False
+        return True
+
     def continue_cleanup(self) -> None:
         """Recheck ownership, immutable ID, and attachments before deletion."""
         operation = self.journal.operation
@@ -679,6 +831,7 @@ class GCPProvider:
                 not owned(self.config, actual, text(entry, "operation_id"))
                 or text(actual, "id") != text(entry, "id")
                 or actual.get("users")
+                or not self.cleanup_authorized(entry)
             ):
                 raise PiccoloError(
                     f"Cleanup target {name} changed or is attached; retained"

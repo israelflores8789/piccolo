@@ -174,6 +174,44 @@ def test_missing_project_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None
         gate(TEST_PROJECT)
 
 
+def test_metadata_regression_write_is_scoped_and_journaled(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients = Clients(AnonymousCredentials())
+    cloud = LiveCloud(approved, clients, manifest)
+    entry = manifest.register(
+        "instance", approved.gcp.name, ZONE, {"labels": labels(approved)}
+    )
+    entry["id"] = "123"
+    manifest.put("resources", entry)
+    instance: Document = {
+        "id": "123",
+        "labels": labels(approved),
+        "metadata": {"fingerprint": "original-fingerprint", "items": []},
+    }
+    monkeypatch.setattr(cloud, "get", Mock(return_value=instance))
+    setter = Mock(return_value=Mock())
+    setter.return_value.name = "metadata-operation"
+    monkeypatch.setattr(clients.instances, "set_metadata", setter)
+    monkeypatch.setattr(cloud, "poll", Mock(return_value={"status": "DONE"}))
+    cloud.set_metadata(ZONE, "123", [{"key": "shutdown-script", "value": "true"}])
+    request = setter.call_args.kwargs["request"]
+    assert request.project == approved.gcp.project_id
+    assert request.instance == approved.gcp.name
+    assert request.zone == ZONE
+    assert request.metadata_resource.fingerprint == "original-fingerprint"
+    assert setter.call_args.kwargs["retry"] is None
+    action = manifest.entries("actions")[-1]
+    assert action["key"] == request.request_id
+    assert action["operation"] == "metadata-operation"
+    assert action["settled"] is True
+    with pytest.raises(PiccoloError, match="unproven"):
+        cloud.set_metadata(ZONE, "replacement-id", [])
+    assert setter.call_count == 1
+
+
 @pytest.mark.parametrize("project", ["downstream-test-alpha", "downstream-test-beta"])
 def test_downstream_project_is_used_for_config_manifest_and_urls(
     approved: Config,

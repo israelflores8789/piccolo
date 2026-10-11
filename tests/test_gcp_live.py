@@ -30,8 +30,8 @@ from gcp_live_support.gcp_live import (
 )
 from gcp_live_support.manifest import Manifest, cleanup, gate
 
-from piccolo.data import document, objects, text
-from piccolo.errors import PiccoloError
+from piccolo.data import Document, document, objects, text
+from piccolo.errors import CapacityError, PiccoloError, UncertainError
 
 pytestmark = pytest.mark.gcp_live
 
@@ -70,13 +70,7 @@ def gcp_run(
     )
     print(f"Durable cleanup manifest: {manifest.path}", flush=True)
     monkeypatch.setenv("PICCOLO_STATE_DIR", str(directory / "state"))
-    for variable in (
-        "CLOUDSDK_AUTH_ACCESS_TOKEN",
-        "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
-        "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
-    ):
-        if os.environ.get(variable):
-            pytest.fail(f"Unset {variable} so gcloud uses the approved human account")
+    GCloudConnection(config.gcp).check_identity()
     with environment_lock(config):
         sdk_credentials = credentials(config.gcp)
         clients = Clients(sdk_credentials)
@@ -310,6 +304,7 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=connection.environment(),
             start_new_session=os.name != "nt",
         )
         deadline = time.monotonic() + 90
@@ -344,6 +339,301 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
             "if test -f ~/piccolo-live-http/pid; then "
             'kill "$(cat ~/piccolo-live-http/pid)"; fi',
         )
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    [
+        "access_token_file",
+        "credential_file_override",
+        "impersonate_service_account",
+    ],
+)
+def test_live_gcloud_persisted_overrides_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    property_name: str,
+) -> None:
+    """Use real gcloud config parsing in a disposable root before any transport."""
+    gate(os.environ.get("PICCOLO_GCP_LIVE_PROJECT", ""))
+    base = profile(Path(os.environ["PICCOLO_GCP_LIVE_CONFIG"]))
+    from piccolo.providers.gcp.connection import GCloudConnection
+
+    root = tmp_path / "isolated-gcloud"
+    configurations = root / "configurations"
+    configurations.mkdir(parents=True)
+    (root / "active_config").write_text("default")
+    (configurations / "config_default").write_text(
+        f"[auth]\n{property_name} = unauthorized-test-value\n"
+    )
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(root))
+    monkeypatch.delenv("CLOUDSDK_ACTIVE_CONFIG_NAME", raising=False)
+    connection = GCloudConnection(base.gcp)
+    with pytest.raises(PiccoloError, match=property_name):
+        connection.execute(base.gcp.zones[0], "true")
+
+
+def test_live_credential_guards_before_guest_access(
+    gcp_run: "GCPProvider",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify H01/H02 guards against a real run-owned VM without unsafe refresh."""
+    from piccolo.providers.gcp.connection import AUTH_OVERRIDES, GCloudConnection
+    from piccolo.providers.gcp.provider import GCPProvider
+    from piccolo.providers.gcp.provision import zone_of
+
+    provider = gcp_run
+    provider.init()
+    instance = provider.active()
+    zone = zone_of(instance)
+    for variable in AUTH_OVERRIDES:
+        with monkeypatch.context() as injection:
+            injection.setenv(variable, "unauthorized-test-value")
+            connection = GCloudConnection(provider.gcp)
+            with pytest.raises(PiccoloError, match=variable):
+                connection.execute(zone, "true")
+            with pytest.raises(PiccoloError, match=variable):
+                connection.copy(zone, provider.config.path, "must-not-upload.toml")
+            with pytest.raises(PiccoloError, match=variable):
+                connection.tunnel(zone)
+    path = tmp_path / "untrusted.json"
+    for payload in (
+        {
+            "type": "external_account",
+            "credential_source": {"url": "http://127.0.0.1/private"},
+        },
+        {"type": "authorized_user", "token_uri": "https://untrusted.invalid/token"},
+    ):
+        path.write_text(json.dumps(payload))
+        for source in ("file", "adc"):
+            with monkeypatch.context() as injection:
+                auth_config = replace(provider.gcp.auth, impersonate_service_account="")
+                if source == "file":
+                    auth_config = replace(
+                        auth_config, mode="file", credential_file=path
+                    )
+                else:
+                    auth_config = replace(auth_config, mode="adc", credential_file=None)
+                    injection.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(path))
+                changed = replace(
+                    provider.config, gcp=replace(provider.gcp, auth=auth_config)
+                )
+                with pytest.raises(PiccoloError):
+                    GCPProvider(changed)
+    assert text(provider.active(), "id") == text(instance, "id")
+    assert (
+        provider.connection.execute(zone, "printf approved-identity")
+        == "approved-identity"
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow,interruption",
+    [
+        ("init", "submission"),
+        ("init", "poll"),
+        ("init", "staging"),
+        ("move", "submission"),
+        ("move", "poll"),
+        ("move", "readiness"),
+        ("move", "commit"),
+    ],
+)
+def test_live_later_fallback_recovery(
+    gcp_run: "GCPProvider",
+    monkeypatch: pytest.MonkeyPatch,
+    workflow: str,
+    interruption: str,
+) -> None:
+    """Inject first-zone capacity failure, then interrupt genuine SDK creation.
+
+    The first failure is synthetic; acceptance, operation lookup/polling, SSH,
+    staging, and relocation use real run-owned cloud resources.
+    """
+    from gcp_live_support.gcp_sdk import LiveCloud
+
+    from piccolo.providers.gcp.connection import GCloudConnection
+    from piccolo.providers.gcp.provider import GCPProvider
+    from piccolo.providers.gcp.provision import zone_of
+
+    provider = gcp_run
+    assert isinstance(provider.cloud, LiveCloud)
+    cloud = provider.cloud
+    if workflow == "move":
+        if len(provider.gcp.zones) < 3:
+            pytest.skip(
+                "Approve three zones to test a move with two fallback candidates"
+            )
+        provider.init()
+        source = provider.active()
+        destination_zones = tuple(
+            zone for zone in provider.gcp.zones if zone != zone_of(source)
+        )
+        failed_zone, accepted_zone = destination_zones[:2]
+    else:
+        failed_zone, accepted_zone = provider.gcp.zones[:2]
+    original_submit, original_poll = cloud.submit, cloud.poll
+    accepted_operation = ""
+
+    def submit(
+        kind: str, name: str, zone: str, resource: Document, request_id: str
+    ) -> str:
+        nonlocal accepted_operation
+        if kind == "instance.insert" and zone == failed_zone:
+            # No SDK request is sent for this deterministic capacity failure.
+            raise CapacityError("Injected confirmed capacity exhaustion")
+        operation = original_submit(kind, name, zone, resource, request_id)
+        if kind == "instance.insert" and zone == accepted_zone:
+            accepted_operation = operation
+            if interruption == "submission":
+                raise UncertainError("Injected lost response after real acceptance")
+        return operation
+
+    def poll(name: str, zone: str) -> Document:
+        if interruption == "poll" and name == accepted_operation:
+            raise UncertainError("Injected polling interruption after real acceptance")
+        return original_poll(name, zone)
+
+    def readiness(_zone: str) -> None:
+        raise PiccoloError("Injected readiness interruption")
+
+    def commit() -> None:
+        raise UncertainError("Injected interruption after durable commit")
+
+    with monkeypatch.context() as injection:
+        injection.setattr(cloud, "submit", submit)
+        injection.setattr(cloud, "poll", poll)
+        if interruption in {"staging", "readiness"}:
+            injection.setattr(provider.connection, "ready", readiness)
+        if interruption == "commit":
+            injection.setattr(provider, "commit_cleanup", commit)
+        with pytest.raises(PiccoloError):
+            if workflow == "init":
+                provider.init()
+            else:
+                provider.move(None)
+    assert accepted_operation
+    creations = [
+        item
+        for item in cloud.manifest.entries("actions")
+        if text(item, "kind").endswith(".insert")
+    ]
+    recovered = GCPProvider(provider.config, cloud, GCloudConnection(provider.gcp))
+    recovered.resume()
+    assert zone_of(recovered.active()) == accepted_zone
+    assert not recovered.journal.operation
+    assert len(recovered.instances()) == 1
+    assert {
+        text(item, "key")
+        for item in cloud.manifest.entries("actions")
+        if text(item, "kind").endswith(".insert")
+    } == {text(item, "key") for item in creations}
+    accepted = original_poll(accepted_operation, accepted_zone)
+    assert text(recovered.active(), "id") == text(accepted, "target_id")
+    print(f"Real {workflow} recovery verified after injected {interruption}")
+
+
+def test_live_unknown_state_preserves_move_recovery(
+    gcp_run: "GCPProvider",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify H04/H05 with real labels, IDs, a stopped source, and a snapshot."""
+    from piccolo.providers.gcp.provider import GCPProvider
+    from piccolo.providers.gcp.provision import zone_of
+
+    provider = gcp_run
+    provider.init()
+    source = provider.active()
+    foreign = GCPProvider(
+        replace(provider.config, environment=provider.config.environment + "-other"),
+        provider.cloud,
+        provider.connection,
+    )
+    for command in ("init", "stop", "move"):
+        with pytest.raises(PiccoloError, match="ownership"):
+            if command == "init":
+                foreign.init(adopt=True)
+            elif command == "stop":
+                foreign.stop()
+            else:
+                foreign.move(None)
+    assert provider.active()["status"] == "RUNNING"
+    destination = next(zone for zone in provider.gcp.zones if zone != zone_of(source))
+
+    def unavailable(_zone: str) -> None:
+        raise PiccoloError("Injected readiness failure")
+
+    with monkeypatch.context() as injection:
+        injection.setattr(provider.connection, "ready", unavailable)
+        with pytest.raises(PiccoloError, match="Injected"):
+            provider.move(destination)
+    operation = provider.journal.operation
+    snapshot_name = text(operation, "snapshot")
+    snapshot = provider.cloud.get("snapshot", snapshot_name)
+    assert snapshot is not None
+    with monkeypatch.context() as isolated:
+        isolated.setenv("PICCOLO_STATE_DIR", str(tmp_path / "empty-state"))
+        unknown = GCPProvider(provider.config, provider.cloud, provider.connection)
+        assert not objects(unknown.cleanup(False), "eligible")
+        unknown.cleanup(True)
+    retained = provider.cloud.get("snapshot", snapshot_name)
+    assert retained is not None and retained["id"] == snapshot["id"]
+    assert provider.journal.operation == operation
+    GCPProvider(provider.config, provider.cloud, provider.connection).resume()
+
+
+def test_live_shutdown_metadata_guards(
+    gcp_run: "GCPProvider",
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attach only harmless instance hooks; project hooks use a read overlay."""
+    from gcp_live_support.gcp_sdk import LiveCloud
+
+    from piccolo.providers.gcp.provision import zone_of
+
+    provider = gcp_run
+    provider.init()
+    assert isinstance(provider.cloud, LiveCloud)
+    cloud = provider.cloud
+    instance = provider.active()
+    zone = zone_of(instance)
+    metadata = document(instance.get("metadata", {}))
+    for key in ("shutdown-script", "shutdown-script-url"):
+        items = [
+            *objects(metadata, "items"),
+            {
+                "key": key,
+                "value": "#!/bin/bash\ntrue\n"
+                if key == "shutdown-script"
+                else "https://example.invalid/piccolo-harmless-shutdown.sh",
+            },
+        ]
+        try:
+            cloud.set_metadata(zone, text(instance, "id"), items)
+            for command in ("stop", "move"):
+                with pytest.raises(PiccoloError, match="shutdown-script"):
+                    if command == "stop":
+                        provider.stop()
+                    else:
+                        provider.move(None)
+            assert provider.active()["status"] == "RUNNING"
+            assert not provider.journal.operation
+        finally:
+            cloud.set_metadata(zone, text(instance, "id"), objects(metadata, "items"))
+        with monkeypatch.context() as overlay:
+            overlay.setattr(
+                cloud,
+                "project_metadata",
+                lambda metadata_key=key: {
+                    "items": [{"key": metadata_key, "value": "true"}]
+                },
+            )
+            with pytest.raises(PiccoloError, match="shutdown-script"):
+                provider.stop()
+    provider.stop()
+    provider.start()
 
 
 if TYPE_CHECKING:

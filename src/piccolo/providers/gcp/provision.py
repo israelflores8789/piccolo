@@ -55,12 +55,17 @@ def boot_disk(instance: Document) -> Document:
 
 
 def reject_startup(metadata: Document) -> None:
-    """Refuse GCP startup scripts that could silently rerun project setup."""
+    """Refuse automatic guest scripts during boot, shutdown, and deletion."""
     for item in objects(metadata, "items"):
         key = text(item, "key").lower()
-        if "startup-script" in key or "sysprep" in key or key == "user-data":
+        if (
+            "startup-script" in key
+            or "shutdown-script" in key
+            or "sysprep" in key
+            or key == "user-data"
+        ):
             raise PiccoloError(
-                f"Unsafe automatic startup metadata {key!r}; "
+                f"Unsafe automatic lifecycle metadata {key!r}; "
                 f"inspect and remove it deliberately before "
                 f"using Piccolo"
             )

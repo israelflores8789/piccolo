@@ -47,7 +47,7 @@ class Provider(Protocol):
         """Describe reconciliation without changing infrastructure."""
         ...
 
-    def init(self) -> None:
+    def init(self, *, adopt: bool = False) -> None:
         """Provision infrastructure and stage an optional script."""
         ...
 
