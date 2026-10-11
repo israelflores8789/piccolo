@@ -32,6 +32,24 @@ user = "researcher"
 """
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--gcp-live",
+        action="store_true",
+        default=False,
+        help="Explicitly select the gated disposable-project GCP suite",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if not config.getoption("--gcp-live"):
+        for item in items:
+            if item.get_closest_marker("gcp_live"):
+                item.add_marker(pytest.mark.skip(reason="requires explicit --gcp-live"))
+
+
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PICCOLO_STATE_DIR", str(tmp_path / "state"))

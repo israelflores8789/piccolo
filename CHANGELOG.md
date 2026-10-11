@@ -16,3 +16,5 @@ All notable changes to this project will be documented in this file. The format 
 - Explicit opaque bootstrap staging and invocation with fresh-disk eligibility, durable guest receipts, and repeat-execution protection.
 - SSH readiness checks and foreground SSH/IAP connections through gcloud.
 - Offline lifecycle, SDK contract, bootstrap, and lock tests, plus a proposed live GCP validation plan.
+- Explicitly gated GCP lifecycle and human IAP tests for the Piccolo GCP project, durable run manifests, an independent scoped janitor, and offline interruption/cleanup safety tests.
+- Configurable live-test project approval through `PICCOLO_GCP_LIVE_PROJECT`, explicit dotenv loading, and manifests that retain their original project for recovery.

@@ -66,12 +66,13 @@ convention = "google"
 preset = "strict"
 python-version = "3.12"
 project-includes = ["src"]
-search-path = ["."]
+search-path = [".", "tests"]
 min-severity = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+markers = ["gcp_live: opt-in disposable-project GCP tests, excluded by default"]
 
 [tool.coverage.run]
 source = ["src/piccolo"]

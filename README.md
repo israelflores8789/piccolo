@@ -193,3 +193,46 @@ just check-dist
 Hatchling builds the `src/piccolo` wheel and an explicitly selected source distribution. `just check-dist` builds both and validates their metadata with Twine. Publishing and GitHub release/push operations are reserved for the repository owner. Release notes follow Keep a Changelog in [CHANGELOG.md](CHANGELOG.md).
 
 Live behavior, IAM propagation, SSH key provisioning, cross-region capacity, Windows terminal interruption, and complete real-resource teardown still require the separately approved validation described in [NEXTSTEPS.md](NEXTSTEPS.md).
+
+## Gated live GCP tests
+
+Ordinary `just test` and `just ci` are cloud-free, including when live opt-in variables are present. Live cases require pytest's explicit `--gcp-live` option, `PICCOLO_GCP_LIVE=1`, and `PICCOLO_GCP_LIVE_PROJECT` set to the exact project ID in the TOML. No project is approved by default. SDK writes and the independent janitor recheck the project gate. The historical lean scripts are never executed by the suite.
+
+All live cases and recovery helpers live under `tests/` and are excluded from the wheel. `just typecheck` checks application code and recovery helpers. Offline safety tests use anonymous SDK credentials, injected operations, and local subprocesses for interruptions, lost responses, cleanup failures, changed IDs, attached disks, incomplete inventories, IAM preservation, and default live-test exclusion. Capacity/quota failures are simulated locally; real quota exhaustion is never a test strategy.
+
+Before a live run, copy `examples/gcp/live-approved.toml` to `.test_runs/approved.toml` and replace its placeholders. Approve billing/spending limits, maximum duration, zones in two regions, machine type, disk size, snapshot location, pinned Linux image, VPC/subnets, provisioner account, existing VM account, human owner connection account, and actual OS Login POSIX username. The example's zones and sizes are proposals, not approval. The image needs SSH, Bash, the Google guest agent, and Python 3 for the harmless HTTP listener. No research bootstrap or real secret payload is used.
+
+Set `PICCOLO_GCP_LIVE_PROJECT` in your shell or copy `examples/gcp-live.env.example` to `.env.gcp-live` and replace its value with the same approved project ID. The local dotenv file is ignored by Git. Load it explicitly with `just --dotenv-path .env.gcp-live`; there is no automatic parent-directory dotenv discovery and no dotenv file is required for ordinary tests or CI. Existing shell variables take precedence over dotenv values, so unset a stale shell approval when switching files. The dotenv example supplies the project approval only; the explicit live recipes still supply execution opt-in. [Just dotenv documentation](https://github.com/casey/just/blob/master/README.md#dotenv-settings).
+
+Enable `serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`, `compute.googleapis.com`, `iam.googleapis.com`, `secretmanager.googleapis.com`, `iamcredentials.googleapis.com`, `iap.googleapis.com`, and `oslogin.googleapis.com` out of band. Enable OS Login in project metadata before running. The suite preserves API state, project metadata/IAM, networks, and existing resources; it fails for missing APIs instead of enabling/disabling them. Disabled-API behavior remains an offline check. Ensure regional subnet coverage and sufficient quotas for temporary source/replacement overlap.
+
+SDK provisioning always impersonates the explicitly configured provisioner using ADC as the source. `GOOGLE_APPLICATION_CREDENTIALS` does not select the human `gcloud` account. The ADC source needs `roles/iam.serviceAccountTokenCreator` on the provisioner; if ADC contains the provisioner's own key, self-impersonation still requires that permission on itself. Authenticate the human owner separately, specify its account and POSIX username, and unset connection credential/access-token/impersonation overrides. The runner rejects inherited access-token/impersonation overrides and configured `gcloud` impersonation. [Impersonation documentation](https://github.com/googleapis/google-auth-library-python/blob/main/docs/user-guide.rst).
+
+The provisioner needs instance/disk/snapshot lifecycle and operation reads, firewall create/get/list/delete, project/subnet reads and subnet use, service-account get/list/create/delete/getIamPolicy/setIamPolicy/testIamPermissions, Secret Manager create/get/list/delete/getIamPolicy/setIamPolicy, and Service Usage discovery/consumption. A practical disposable-project bundle is `roles/compute.instanceAdmin.v1`, `roles/compute.securityAdmin`, `roles/compute.viewer`, `roles/iam.serviceAccountAdmin`, `roles/secretmanager.admin`, and `roles/serviceusage.serviceUsageConsumer`, plus `resourcemanager.projects.get`. Provisioner and connector both need `roles/iam.serviceAccountUser` on the pre-existing VM account, configured out of band. The human owner needs effective IAP TCP forwarding and OS Login permissions. Account attachment's `iam.serviceAccounts.actAs` is separate from impersonation's Token Creator permission. [Service account access documentation](https://docs.cloud.google.com/iam/docs/manage-access-service-accounts).
+
+Each lifecycle/tunnel case runs with both the existing guest account and a unique account created through Piccolo. For the created account, the adapter persists creation intent, then records and adds temporary account-scoped `roles/iam.serviceAccountUser` members for the provisioner and human. It checks provisioner `actAs` before VM creation. Cleanup removes only those added unconditional members from fresh policies with etags after compute resources are gone, preserving unrelated members/conditions. The pre-existing guest account's policy is never changed.
+
+After explicit authorization for creation, harmless guest execution/SSH/IAP, relocation, and scoped teardown, run exactly:
+
+```bash
+just --dotenv-path .env.gcp-live test-gcp-live .test_runs/approved.toml
+```
+
+For CI or shell-only use, supply the variable directly: `PICCOLO_GCP_LIVE_PROJECT=my-disposable-test-project just test-gcp-live .test_runs/approved.toml`. The recipe reads the approval without replacing it with the TOML's target project.
+
+This command was not run while implementing the suite. It streams output to `.test_logs/pytest-gcp-live.log`, preserves pytest's exit status, and retains per-run `.test_runs/plive-RUN/` directories containing generated sanitized TOML, harmless marker script, isolated Piccolo state, baseline inventory/API state, and `manifest.json`. Credentials and secret payloads are not logged. Keep these files for recovery and evidence.
+
+Live assertions cover repeated-init identities, explicit bootstrap and repeat/change/missing-history guards, sentinel hashes across regions, security/account/subnet preservation, cleanup previews, human SSH/IAP traffic, and tunnel interruption. Failed/uncertain bootstrap launches and interrupted relocation stages remain deterministic offline checks. Windows/Git Bash outcomes, IAM propagation, and actual spend still require authorized live validation.
+
+Fixture teardown runs in `finally`, including ordinary interruption and setup/assertion failures. It reconciles persisted requests before deleting dependencies, removes proven run-owned VMs, checks disk identities/detachments, then removes disks/snapshots/firewalls, added IAM members, dummy secrets, and created accounts. Unknown creates without observable operations are retained rather than retried or declared absent. Cleanup refuses changed IDs, untracked attachments, auto-delete disks, foreign ownership, and unsafe IAM targets. Prefix inventory detects strays but never authorizes deletion by prefix alone. Unresolved operations, failed deletions, and incomplete inventories fail teardown; leftovers may continue to incur costs.
+
+After a hard kill or workstation loss, run the independent janitor against the durable files. It shares the fixture's environment lock. Preview first, then apply within the approved deletion scope:
+
+```bash
+just --dotenv-path .env.gcp-live janitor-gcp-live .test_runs/plive-RUN/manifest.json
+just --dotenv-path .env.gcp-live janitor-gcp-live .test_runs/plive-RUN/manifest.json 1
+```
+
+Replace `plive-RUN` with the exact directory printed by the runner. The janitor needs neither pytest nor the original fixture process. Preserve unresolved manifests and arrange a follow-up inventory/second janitor invocation; `finally` cannot handle workstation loss. Successful manifests retain the zero-leftover result. No janitor action deletes the project or disables APIs. Project deletion requires separate owner action and approval.
+
+Each manifest stores the resolved project ID at creation, and resource URLs use that recorded ID. Editing or removing a dotenv file does not retarget an existing manifest. Janitor execution requires the environment approval, manifest project, and recovery TOML project to agree before credentials are loaded; mismatches fail instead of redirecting cleanup.

@@ -1,0 +1,303 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+"""gcp_live.py — Offline profile validation and independently invocable janitor.
+
+Set PICCOLO_GCP_LIVE_PROJECT to match the live profile and recovery manifest.
+"""
+
+import argparse
+import json
+import os
+import re
+import socket
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from gcp_live_support.manifest import Manifest, cleanup, gate
+from piccolo.config import Config, load
+from piccolo.data import Document, objects, text
+from piccolo.errors import PiccoloError
+from piccolo.state.lock import environment_lock
+
+
+def profile(path: Path) -> Config:
+    """Validate approved inputs locally before credentials or clients are loaded."""
+    config = load(path)
+    gcp = config.gcp
+    gate(gcp.project_id)
+    if (
+        not gcp.auth.impersonate_service_account.endswith(
+            f"@{gcp.project_id}.iam.gserviceaccount.com"
+        )
+        or not gcp.connection_account
+        or "@" not in gcp.connection_account
+        or gcp.connection_account.endswith(".gserviceaccount.com")
+        or gcp.connection_impersonate
+        or gcp.service_account == gcp.auth.impersonate_service_account
+        or gcp.create_service_account
+        or gcp.enable_apis
+        or gcp.project_roles
+        or gcp.secrets
+        or config.bootstrap is not None
+    ):
+        raise PiccoloError(
+            "Live profile requires provisioner impersonation, separate human "
+            "connection account, existing VM account, pre-enabled APIs, "
+            "and no bootstrap, secrets, or project roles"
+        )
+    if len(gcp.zones) < 2 or len({z.rsplit("-", 1)[0] for z in gcp.zones}) < 2:
+        raise PiccoloError("Approve at least two zones in different regions")
+    if re.fullmatch(r"projects/[^/]+/global/images/[^/]+", gcp.image) is None:
+        raise PiccoloError("Approve a pinned image, not an image family")
+    if any(
+        "REPLACE" in item
+        for item in (
+            gcp.auth.impersonate_service_account,
+            gcp.connection_account,
+            gcp.service_account,
+            gcp.ssh_user,
+            gcp.image,
+        )
+    ):
+        raise PiccoloError("Complete the live profile placeholders before running")
+    return config
+
+
+def run_config(
+    base: Config, directory: Path, run: str, *, create_account: bool
+) -> Config:
+    """Write a sanitized durable config and an exclusively harmless bootstrap."""
+    g = base.gcp
+    gate(g.project_id)
+    directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+    script = directory / "marker.sh"
+    script.write_text(
+        "#!/bin/bash\n# Copyright 2026 Israel Flores-Arbolay\n"
+        "# SPDX-License-Identifier: Apache-2.0\n"
+        'set -eu\nprintf "piccolo live marker\\n" >> "$HOME/piccolo-live-marker"\n'
+    )
+    quote = json.dumps
+    account = (
+        f"{run}-vm@{g.project_id}.iam.gserviceaccount.com"
+        if create_account
+        else g.service_account
+    )
+    subnet_map = ", ".join(f"{quote(k)} = {quote(v)}" for k, v in g.subnets.items())
+    credential = (
+        f"credential_file = {quote(str(g.auth.credential_file))}\n"
+        if g.auth.credential_file
+        else ""
+    )
+    path = directory / "piccolo.toml"
+    path.write_text(f"""# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+schema_version = 1
+provider = "gcp"
+environment = {quote(run)}
+[bootstrap]
+script = "marker.sh"
+remote_path = ".piccolo/bootstrap/marker.sh"
+execution_user = {quote(g.ssh_user)}
+timeout = 120
+[gcp]
+project_id = {quote(g.project_id)}
+enable_apis = false
+operation_timeout = {g.operation_timeout}
+[gcp.auth]
+mode = {quote(g.auth.mode)}
+{credential}impersonate_service_account = {quote(g.auth.impersonate_service_account)}
+[gcp.instance]
+name = {quote(run + "-vm")}
+service_account = {quote(account)}
+machine_type = {quote(g.machine_type)}
+[gcp.placement]
+zones = {quote(g.zones)}
+snapshot_location = {quote(g.snapshot_location)}
+[gcp.disk]
+image = {quote(g.image)}
+size_gb = {g.size_gb}
+type = {quote(g.disk_type)}
+[gcp.network]
+name = {quote(g.network)}
+subnet = {quote(g.subnet)}
+subnets = {{ {subnet_map} }}
+external_ip = {str(g.external_ip).lower()}
+[gcp.iap]
+firewall_name = {quote(run + "-iap")}
+ports = [22, 8080]
+source_ranges = ["35.235.240.0/20"]
+[gcp.iam]
+create_service_account = {str(create_account).lower()}
+secrets = [{quote(run + "-dummy")}]
+project_roles = []
+[gcp.ssh]
+user = {quote(g.ssh_user)}
+account = {quote(g.connection_account)}
+via_iap = true
+readiness_timeout = {g.readiness_timeout}
+[gcp.tunnel]
+remote_port = 8080
+local_port = {g.local_port}
+""")
+    return load(path)
+
+
+def preflight(
+    config: Config, cloud: "LiveCloud", connection: "GCloudConnection"
+) -> None:
+    """Inspect dependencies and baseline before the first fixture mutation."""
+    from google.cloud import service_usage_v1
+    from google.iam.v1 import iam_policy_pb2
+
+    from piccolo.providers.gcp.access import Access
+    from piccolo.providers.gcp.provision import reject_startup
+    from piccolo.providers.gcp.resources import READ_RETRY
+
+    project = cloud.clients.projects.get_project(
+        name=f"projects/{config.gcp.project_id}", retry=READ_RETRY, timeout=30
+    )
+    permissions = [
+        "compute.instances.create",
+        "compute.instances.delete",
+        "compute.instances.get",
+        "compute.instances.list",
+        "compute.instances.start",
+        "compute.instances.stop",
+        "compute.instances.setDiskAutoDelete",
+        "compute.instances.setMetadata",
+        "compute.disks.create",
+        "compute.disks.delete",
+        "compute.disks.get",
+        "compute.disks.list",
+        "compute.disks.use",
+        "compute.disks.createSnapshot",
+        "compute.snapshots.create",
+        "compute.snapshots.delete",
+        "compute.snapshots.get",
+        "compute.snapshots.list",
+        "compute.snapshots.useReadOnly",
+        "compute.firewalls.create",
+        "compute.firewalls.delete",
+        "compute.firewalls.get",
+        "compute.firewalls.list",
+        "compute.projects.get",
+        "compute.subnetworks.get",
+        "compute.subnetworks.use",
+        "compute.zoneOperations.get",
+        "compute.zoneOperations.list",
+        "compute.globalOperations.get",
+        "compute.globalOperations.list",
+        "iam.serviceAccounts.get",
+        "iam.serviceAccounts.list",
+        "iam.serviceAccounts.create",
+        "iam.serviceAccounts.delete",
+        "iam.serviceAccounts.getIamPolicy",
+        "iam.serviceAccounts.setIamPolicy",
+        "secretmanager.secrets.create",
+        "secretmanager.secrets.delete",
+        "secretmanager.secrets.get",
+        "secretmanager.secrets.list",
+        "secretmanager.secrets.getIamPolicy",
+        "secretmanager.secrets.setIamPolicy",
+    ]
+    if config.gcp.external_ip:
+        permissions.append("compute.subnetworks.useExternalIp")
+    granted = cloud.clients.projects.test_iam_permissions(
+        request=iam_policy_pb2.TestIamPermissionsRequest(
+            resource=f"projects/{config.gcp.project_id}",
+            permissions=permissions,
+        ),
+        retry=READ_RETRY,
+        timeout=30,
+    )
+    missing = set(permissions) - set(granted.permissions)
+    if missing:
+        raise PiccoloError(
+            "Provisioner lacks lifecycle/teardown permissions: "
+            + ", ".join(sorted(missing))
+        )
+    required = Access(config, cloud.clients).required_apis() | {
+        "secretmanager.googleapis.com",
+        "iap.googleapis.com",
+        "oslogin.googleapis.com",
+    }
+    baseline = []
+    for api in sorted(required):
+        service = cloud.clients.services.get_service(
+            request=service_usage_v1.GetServiceRequest(
+                name=f"{project.name}/services/{api}"
+            ),
+            retry=READ_RETRY,
+            timeout=30,
+        )
+        if service.state != service_usage_v1.State.ENABLED:
+            raise PiccoloError(
+                f"Enable {api} out of band; live tests preserve API state"
+            )
+        baseline.append(api)
+    metadata = cloud.project_metadata()
+    reject_startup(metadata)
+    if not any(
+        text(i, "key") == "enable-oslogin" and text(i, "value").lower() == "true"
+        for i in objects(metadata, "items")
+    ):
+        raise PiccoloError(
+            "Enable OS Login out of band to avoid project SSH-key mutations"
+        )
+    for zone in config.gcp.zones:
+        cloud.subnet(zone)
+    connection.check_identity()
+    impersonation = connection.run(
+        ["config", "get-value", "auth/impersonate_service_account"]
+    )
+    if impersonation.returncode or impersonation.stdout.strip() not in {"", "(unset)"}:
+        raise PiccoloError(
+            "Unset gcloud auth/impersonate_service_account for human connections"
+        )
+    with socket.socket() as local:
+        try:
+            local.bind(("127.0.0.1", config.gcp.local_port))
+        except OSError as exc:
+            raise PiccoloError("Approved local tunnel port is unavailable") from exc
+    cloud.manifest.data["baseline_apis"] = [api for api in baseline]
+    inventory: Document = {}
+    for kind in ("instance", "disk", "snapshot", "firewall", "secret", "account"):
+        inventory[kind] = [item for item in cloud.inventory(kind)]
+    cloud.manifest.data["baseline_inventory"] = inventory
+    cloud.manifest.save()
+
+
+def main() -> None:
+    """Preview or apply cleanup independently of pytest and its temporary state."""
+    parser = argparse.ArgumentParser(description="Piccolo live GCP manifest janitor")
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    manifest = Manifest.open(args.manifest)
+    gate(text(manifest.data, "project"))
+    config = load(Path(text(manifest.data, "config")))
+    gate(config.gcp.project_id)
+    # Import optional SDKs only after validating local gates and manifest identity.
+    from gcp_live_support.gcp_sdk import LiveCloud
+    from piccolo.providers.gcp.auth import credentials
+    from piccolo.providers.gcp.clients import Clients
+
+    os.environ["PICCOLO_STATE_DIR"] = str(manifest.directory / "state")
+    with environment_lock(config):
+        cloud = LiveCloud(config, Clients(credentials(config.gcp)), manifest)
+        if not args.apply:
+            print(json.dumps(manifest.entries("resources"), indent=2))
+        failures = cleanup(manifest, cloud, apply=args.apply)
+        if failures:
+            raise SystemExit("\n".join(failures))
+        print("Zero leftovers verified" if args.apply else "Preview only; no deletions")
+
+
+# Type-only imports keep profile checks and ordinary collection cloud-free.
+if TYPE_CHECKING:
+    from gcp_live_support.gcp_sdk import LiveCloud
+    from piccolo.providers.gcp.connection import GCloudConnection
+
+if __name__ == "__main__":
+    main()

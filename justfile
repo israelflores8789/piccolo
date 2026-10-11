@@ -15,6 +15,30 @@ install-dev:
 test *args:
     {{pytest}} -v -s {{args}}
 
+# Set PICCOLO_GCP_LIVE_PROJECT directly or load it with --dotenv-path.
+test-gcp-live config test-name="tests/test_gcp_live.py":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
+    mkdir -p .test_logs .test_runs
+    PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="{{ config }}" \
+        {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "{{ test-name }}" < /dev/null \
+        2>&1 | tee .test_logs/pytest-gcp-live.log
+
+# Recovery is preview-only unless apply=1; uses the retained run manifest.
+janitor-gcp-live manifest apply="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
+    args=()
+    case "{{ apply }}" in
+        0) ;;
+        1) args+=(--apply) ;;
+        *) echo "apply must be 0 or 1" >&2; exit 2 ;;
+    esac
+    PICCOLO_GCP_LIVE=1 \
+        uv run python tests/gcp_janitor.py --manifest "{{ manifest }}" "${args[@]}"
+
 coverage *args:
     uv run --with pytest-cov pytest --cov=src/piccolo --cov-report=term-missing {{args}}
 
@@ -44,7 +68,7 @@ lint-fix:
     uv run ruff format {{check_dirs}}
 
 typecheck:
-    uv run pyrefly check {{src_dir}}
+    uv run pyrefly check {{src_dir}} tests/gcp_live_support
 
 spell-diff:
     uvx --from typos typos --diff
