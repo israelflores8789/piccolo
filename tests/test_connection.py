@@ -61,14 +61,17 @@ def test_readiness_retries_then_succeeds(
     assert mocked.call_count == 2
 
 
+@pytest.mark.parametrize(
+    "diagnostic", ["Permission denied", "Your platform does not support SSH."]
+)
 def test_permission_failure_is_not_retried(
-    config: Config, monkeypatch: pytest.MonkeyPatch
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
 ) -> None:
     connection = GCloudConnection(config.gcp)
     monkeypatch.setattr(connection, "check_identity", lambda: None)
-    mocked = Mock(
-        return_value=subprocess.CompletedProcess([], 255, "", "Permission denied")
-    )
+    mocked = Mock(return_value=subprocess.CompletedProcess([], 255, "", diagnostic))
     monkeypatch.setattr(connection, "run", mocked)
     with pytest.raises(PiccoloError, match="permission"):
         connection.ready("us-west1-a")

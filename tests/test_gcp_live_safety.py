@@ -15,7 +15,13 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from gcp_live_support.gcp_live import preflight, profile, run_config
+from gcp_live_support.gcp_live import (
+    local_preflight,
+    preflight,
+    profile,
+    provisioner_identity,
+    run_config,
+)
 from gcp_live_support.gcp_sdk import LiveAccess, LiveCloud
 from gcp_live_support.manifest import (
     Manifest,
@@ -258,6 +264,28 @@ def test_changed_approval_blocks_mutation_after_adapter_creation(
     getter.assert_not_called()
     insert.assert_not_called()
     assert not manifest.entries("actions")
+
+
+def test_existing_secret_target_is_preserved_and_requires_exact_identity(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved = replace(
+        approved, gcp=replace(approved.gcp, secrets=("approved-secret",))
+    )
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    observed: Document = {"id": "original", "name": "approved-secret"}
+    monkeypatch.setattr(cloud, "get", Mock(return_value=observed))
+    cloud.preserve_external("secret", "approved-secret")
+    entry = manifest.lookup("secret", "approved-secret")
+    assert entry is not None and cloud.owns(entry, observed)
+    assert not manifest.entries("resources")
+    with pytest.raises(PiccoloError, match="cannot be deleted"):
+        cloud.delete(entry)
+    assert not cloud.owns(entry, {"id": "replacement"})
+    with pytest.raises(PiccoloError, match="explicitly approved"):
+        cloud.preserve_external("secret", "unapproved-secret")
 
 
 @pytest.mark.parametrize("change_approval", [False, True])
@@ -687,7 +715,7 @@ def test_default_collection_is_cloud_free_even_with_opt_in_environment(
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.startswith("ssss")
+    assert result.stdout.startswith("sssss")
 
 
 def test_preflight_requires_delete_permissions_before_writes(
@@ -718,7 +746,7 @@ def test_preflight_requires_delete_permissions_before_writes(
     requested = tester.call_args.kwargs["request"].permissions
     assert "compute.instances.delete" in requested
     assert "compute.disks.delete" in requested
-    assert "iam.serviceAccounts.delete" in requested
+    assert "iam.serviceAccounts.delete" not in requested
     assert "secretmanager.secrets.delete" in requested
     creator.assert_not_called()
     assert not manifest.entries("actions")
@@ -812,7 +840,10 @@ def test_unobserved_sync_create_stays_uncertain_without_retry(
     manifest: Manifest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    approved = replace(approved, gcp=replace(approved.gcp, create_service_account=True))
+    approved = replace(
+        approved,
+        gcp=replace(approved.gcp, create_service_account=True, operation_timeout=0),
+    )
     clients = Clients(AnonymousCredentials())
     monkeypatch.setattr(
         clients.iam,
@@ -828,6 +859,27 @@ def test_unobserved_sync_create_stays_uncertain_without_retry(
     with pytest.raises(PiccoloError, match="already recorded"):
         LiveAccess(cloud).service_account()
     creator.assert_called_once()
+
+
+def test_sync_account_visibility_is_reconciled_with_reads_only(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = approved.gcp.service_account
+    manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
+    observed: Document = {"id": "immutable", "displayName": f"Piccolo {RUN}"}
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    getter = Mock(side_effect=[None, observed, observed, None])
+    monkeypatch.setattr(cloud, "get", getter)
+    wait = Mock()
+    monkeypatch.setattr("gcp_live_support.gcp_sdk.time.sleep", wait)
+    create = manifest.intent("account.create", name, "")
+    assert cloud.settle(create)
+    delete = manifest.intent("account.delete", name, "")
+    assert cloud.settle(delete)
+    assert getter.call_count == 4
+    assert wait.call_count == 2
 
 
 def test_definitively_rejected_create_allows_zero_leftover_cleanup(
@@ -871,11 +923,22 @@ def test_firewall_sdk_request_has_run_intent_and_idempotency(
     LiveAccess(cloud).firewall()
 
 
+@pytest.mark.parametrize("direct", [False, True])
 def test_created_account_waits_for_act_as_without_recreating(
     approved: Config,
     manifest: Manifest,
     monkeypatch: pytest.MonkeyPatch,
+    direct: bool,
 ) -> None:
+    provisioner = approved.gcp.auth.impersonate_service_account
+    if direct:
+        approved = replace(
+            approved,
+            gcp=replace(
+                approved.gcp,
+                auth=replace(approved.gcp.auth, impersonate_service_account=""),
+            ),
+        )
     clients = Clients(AnonymousCredentials())
     name = approved.gcp.service_account
     manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
@@ -901,9 +964,46 @@ def test_created_account_waits_for_act_as_without_recreating(
     monkeypatch.setattr(clients.iam, "create_service_account", creator)
     wait = Mock()
     monkeypatch.setattr("gcp_live_support.gcp_sdk.time.sleep", wait)
-    cloud = LiveCloud(approved, clients, manifest)
+    cloud = LiveCloud(approved, clients, manifest, provisioner=provisioner)
     monkeypatch.setattr(cloud, "binding", Mock())
     LiveAccess(cloud).service_account()
     assert tester.call_count == 2
     wait.assert_called_once_with(2)
     creator.assert_not_called()
+    cloud.binding.assert_any_call(
+        "account", name, "roles/iam.serviceAccountUser", f"serviceAccount:{provisioner}"
+    )
+
+
+def test_direct_profile_and_identity(approved: Config, tmp_path: Path) -> None:
+    approved = replace(
+        approved,
+        gcp=replace(
+            approved.gcp,
+            auth=replace(approved.gcp.auth, impersonate_service_account=""),
+        ),
+    )
+    generated = run_config(approved, tmp_path / "direct", RUN, create_account=False)
+    content = generated.path.read_text()
+    generated.path.write_text(
+        content[: content.index("[bootstrap]")] + content[content.index("[gcp]") :]
+    )
+    assert not profile(generated.path).gcp.auth.impersonate_service_account
+    provisioner = f"provisioner@{TEST_PROJECT}.iam.gserviceaccount.com"
+    assert (
+        provisioner_identity(Mock(service_account_email=provisioner), generated)
+        == provisioner
+    )
+    with pytest.raises(PiccoloError, match="provisioner"):
+        provisioner_identity(
+            Mock(service_account_email=generated.gcp.service_account), generated
+        )
+
+
+def test_missing_openssh_fails_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gcp_live_support.gcp_live.shutil.which",
+        lambda name: None if name == "ssh" else "/installed",
+    )
+    with pytest.raises(PiccoloError, match="ssh"):
+        local_preflight()

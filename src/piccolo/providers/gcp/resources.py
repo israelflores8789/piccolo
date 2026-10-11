@@ -39,7 +39,9 @@ class SDKCloud:
                     )
                     return decode(
                         compute_v1.Instance.to_json(
-                            result, preserving_proto_field_name=True
+                            result,
+                            preserving_proto_field_name=True,
+                            use_integers_for_enums=False,
                         )
                     )
                 case "disk":
@@ -51,7 +53,11 @@ class SDKCloud:
                         timeout=30,
                     )
                     return decode(
-                        compute_v1.Disk.to_json(disk, preserving_proto_field_name=True)
+                        compute_v1.Disk.to_json(
+                            disk,
+                            preserving_proto_field_name=True,
+                            use_integers_for_enums=False,
+                        )
                     )
                 case "snapshot":
                     snapshot = self.clients.snapshots.get(
@@ -62,7 +68,9 @@ class SDKCloud:
                     )
                     return decode(
                         compute_v1.Snapshot.to_json(
-                            snapshot, preserving_proto_field_name=True
+                            snapshot,
+                            preserving_proto_field_name=True,
+                            use_integers_for_enums=False,
                         )
                     )
                 case _:
@@ -89,7 +97,9 @@ class SDKCloud:
                         instances.extend(
                             decode(
                                 compute_v1.Instance.to_json(
-                                    item, preserving_proto_field_name=True
+                                    item,
+                                    preserving_proto_field_name=True,
+                                    use_integers_for_enums=False,
                                 )
                             )
                             for item in scope.instances
@@ -108,7 +118,9 @@ class SDKCloud:
                         disks.extend(
                             decode(
                                 compute_v1.Disk.to_json(
-                                    item, preserving_proto_field_name=True
+                                    item,
+                                    preserving_proto_field_name=True,
+                                    use_integers_for_enums=False,
                                 )
                             )
                             for item in scope.disks
@@ -118,7 +130,9 @@ class SDKCloud:
                     return [
                         decode(
                             compute_v1.Snapshot.to_json(
-                                item, preserving_proto_field_name=True
+                                item,
+                                preserving_proto_field_name=True,
+                                use_integers_for_enums=False,
                             )
                         )
                         for item in self.clients.snapshots.list(
@@ -255,7 +269,9 @@ class SDKCloud:
                 )
             return decode(
                 compute_v1.Operation.to_json(
-                    operation, preserving_proto_field_name=True
+                    operation,
+                    preserving_proto_field_name=True,
+                    use_integers_for_enums=False,
                 )
             )
         except exceptions.GoogleAPICallError as exc:
@@ -341,6 +357,8 @@ class SDKCloud:
             ) from exc
         return decode(
             compute_v1.Metadata.to_json(
-                project.common_instance_metadata, preserving_proto_field_name=True
+                project.common_instance_metadata,
+                preserving_proto_field_name=True,
+                use_integers_for_enums=False,
             )
         )

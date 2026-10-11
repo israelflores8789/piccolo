@@ -18,3 +18,13 @@ All notable changes to this project will be documented in this file. The format 
 - Offline lifecycle, SDK contract, bootstrap, and lock tests, plus a proposed live GCP validation plan.
 - Explicitly gated GCP lifecycle and human IAP tests for the Piccolo GCP project, durable run manifests, an independent scoped janitor, and offline interruption/cleanup safety tests.
 - Configurable live-test project approval through `PICCOLO_GCP_LIVE_PROJECT`, explicit dotenv loading, and manifests that retain their original project for recovery.
+- Scoped live grants on approved existing secrets, conditional account-creation permission checks, and guest verification of dummy secret access.
+
+### Fixed
+
+- Accept direct provisioner credentials in live profiles, test human-source impersonation separately, and use the authenticated provisioner for temporary attachment grants.
+- Check local gcloud and OpenSSH prerequisites before live provisioning.
+
+- Decode Compute enum values as names for resource inspection and operation recovery.
+- Fail SSH readiness promptly when local SSH support is missing.
+- Reconcile eventual service-account visibility through bounded reads without resubmitting mutations.

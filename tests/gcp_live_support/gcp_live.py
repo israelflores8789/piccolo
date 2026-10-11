@@ -10,13 +10,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from gcp_live_support.manifest import Manifest, cleanup, gate
 from piccolo.config import Config, load
-from piccolo.data import Document, objects, text
+from piccolo.data import Document, text
 from piccolo.errors import PiccoloError
 from piccolo.state.lock import environment_lock
 
@@ -27,8 +28,11 @@ def profile(path: Path) -> Config:
     gcp = config.gcp
     gate(gcp.project_id)
     if (
-        not gcp.auth.impersonate_service_account.endswith(
-            f"@{gcp.project_id}.iam.gserviceaccount.com"
+        (
+            gcp.auth.impersonate_service_account
+            and not gcp.auth.impersonate_service_account.endswith(
+                f"@{gcp.project_id}.iam.gserviceaccount.com"
+            )
         )
         or not gcp.connection_account
         or "@" not in gcp.connection_account
@@ -38,13 +42,12 @@ def profile(path: Path) -> Config:
         or gcp.create_service_account
         or gcp.enable_apis
         or gcp.project_roles
-        or gcp.secrets
         or config.bootstrap is not None
     ):
         raise PiccoloError(
-            "Live profile requires provisioner impersonation, separate human "
+            "Live profile requires a separate provisioner identity and human "
             "connection account, existing VM account, pre-enabled APIs, "
-            "and no bootstrap, secrets, or project roles"
+            "and no bootstrap or project roles"
         )
     if len(gcp.zones) < 2 or len({z.rsplit("-", 1)[0] for z in gcp.zones}) < 2:
         raise PiccoloError("Approve at least two zones in different regions")
@@ -62,6 +65,17 @@ def profile(path: Path) -> Config:
     ):
         raise PiccoloError("Complete the live profile placeholders before running")
     return config
+
+
+def local_preflight() -> None:
+    """Require gcloud and OpenSSH before loading cloud credentials."""
+    missing = [
+        name
+        for name in ("gcloud", "ssh", "scp", "ssh-keygen")
+        if not shutil.which(name)
+    ]
+    if missing:
+        raise PiccoloError("Install connection prerequisites: " + ", ".join(missing))
 
 
 def run_config(
@@ -129,7 +143,7 @@ ports = [22, 8080]
 source_ranges = ["35.235.240.0/20"]
 [gcp.iam]
 create_service_account = {str(create_account).lower()}
-secrets = [{quote(run + "-dummy")}]
+secrets = {quote((run + "-dummy", *g.secrets))}
 project_roles = []
 [gcp.ssh]
 user = {quote(g.ssh_user)}
@@ -190,10 +204,7 @@ def preflight(
         "compute.globalOperations.list",
         "iam.serviceAccounts.get",
         "iam.serviceAccounts.list",
-        "iam.serviceAccounts.create",
-        "iam.serviceAccounts.delete",
         "iam.serviceAccounts.getIamPolicy",
-        "iam.serviceAccounts.setIamPolicy",
         "secretmanager.secrets.create",
         "secretmanager.secrets.delete",
         "secretmanager.secrets.get",
@@ -201,6 +212,14 @@ def preflight(
         "secretmanager.secrets.getIamPolicy",
         "secretmanager.secrets.setIamPolicy",
     ]
+    if config.gcp.create_service_account:
+        permissions.extend(
+            [
+                "iam.serviceAccounts.create",
+                "iam.serviceAccounts.delete",
+                "iam.serviceAccounts.setIamPolicy",
+            ]
+        )
     if config.gcp.external_ip:
         permissions.append("compute.subnetworks.useExternalIp")
     granted = cloud.clients.projects.test_iam_permissions(
@@ -238,13 +257,7 @@ def preflight(
         baseline.append(api)
     metadata = cloud.project_metadata()
     reject_startup(metadata)
-    if not any(
-        text(i, "key") == "enable-oslogin" and text(i, "value").lower() == "true"
-        for i in objects(metadata, "items")
-    ):
-        raise PiccoloError(
-            "Enable OS Login out of band to avoid project SSH-key mutations"
-        )
+    # Run-owned VMs receive OS Login metadata; project metadata is preserved.
     for zone in config.gcp.zones:
         cloud.subnet(zone)
     connection.check_identity()
@@ -285,7 +298,13 @@ def main() -> None:
 
     os.environ["PICCOLO_STATE_DIR"] = str(manifest.directory / "state")
     with environment_lock(config):
-        cloud = LiveCloud(config, Clients(credentials(config.gcp)), manifest)
+        sdk_credentials = credentials(config.gcp)
+        cloud = LiveCloud(
+            config,
+            Clients(sdk_credentials),
+            manifest,
+            provisioner=provisioner_identity(sdk_credentials, config),
+        )
         if not args.apply:
             print(json.dumps(manifest.entries("resources"), indent=2))
         failures = cleanup(manifest, cloud, apply=args.apply)
@@ -298,6 +317,21 @@ def main() -> None:
 if TYPE_CHECKING:
     from gcp_live_support.gcp_sdk import LiveCloud
     from piccolo.providers.gcp.connection import GCloudConnection
+
+
+def provisioner_identity(credentials: object, config: Config) -> str:
+    """Require an authenticated service account distinct from the guest account."""
+    identity = getattr(credentials, "service_account_email", None)
+    if (
+        not isinstance(identity, str)
+        or not identity.endswith(f"@{config.gcp.project_id}.iam.gserviceaccount.com")
+        or identity == config.gcp.service_account
+    ):
+        raise PiccoloError(
+            "Live SDK credentials must identify the approved project's provisioner"
+        )
+    return identity
+
 
 if __name__ == "__main__":
     main()

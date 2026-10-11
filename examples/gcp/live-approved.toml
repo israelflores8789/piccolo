@@ -14,7 +14,8 @@ operation_timeout = 600
 
 [gcp.auth]
 mode = "adc"
-impersonate_service_account = "REPLACE-provisioner@<piccolo-project-id>.iam.gserviceaccount.com"
+# ADC may be the provisioner's key; optional impersonation requires another source.
+# impersonate_service_account = "REPLACE-provisioner@<piccolo-project-id>.iam.gserviceaccount.com"
 
 [gcp.instance]
 name = "live-profile"

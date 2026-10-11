@@ -26,7 +26,14 @@ from piccolo.providers.gcp.resources import READ_RETRY, SDKCloud
 class LiveCloud(SDKCloud):
     """Record all test provisioning and janitor writes before sending requests."""
 
-    def __init__(self, config: Config, clients: Clients, manifest: Manifest) -> None:
+    def __init__(
+        self,
+        config: Config,
+        clients: Clients,
+        manifest: Manifest,
+        *,
+        provisioner: str = "",
+    ) -> None:
         """Reject config/manifest mismatches before using supplied SDK clients."""
         manifest.validate()
         gate(config.gcp.project_id)
@@ -41,6 +48,7 @@ class LiveCloud(SDKCloud):
             )
         super().__init__(config, clients)
         self.manifest = manifest
+        self.provisioner = provisioner or config.gcp.auth.impersonate_service_account
 
     @override
     def get(self, kind: str, name: str, zone: str = "") -> Document | None:
@@ -92,6 +100,17 @@ class LiveCloud(SDKCloud):
         proof = document(entry.get("proof", {}))
         kind = text(entry, "kind")
         run = text(self.manifest.data, "run")
+        if entry.get("preserve") is True:
+            allowed = (kind == "secret" and name in self.config.gcp.secrets) or (
+                kind == "account"
+                and name == self.config.gcp.auth.impersonate_service_account
+            )
+            return (
+                allowed
+                and entry.get("absent_before") is False
+                and bool(text(entry, "id"))
+                and text(entry, "id") == text(observed, "id")
+            )
         required_proof: Document
         if kind in {"instance", "disk", "snapshot"}:
             required_proof = {"labels": labels(self.config)}
@@ -126,6 +145,37 @@ class LiveCloud(SDKCloud):
             elif observed.get(key) != expected:
                 return False
         return True
+
+    def preserve_external(self, kind: str, name: str) -> None:
+        """Track an approved existing policy target without authorizing deletion."""
+        allowed = (kind == "secret" and name in self.config.gcp.secrets) or (
+            kind == "account"
+            and name == self.config.gcp.auth.impersonate_service_account
+        )
+        if not allowed:
+            raise PiccoloError("Existing target was not explicitly approved")
+        observed = self.get(kind, name)
+        if observed is None:
+            raise PiccoloError("Approved existing policy target is missing")
+        previous = self.manifest.lookup(kind, name)
+        if previous is not None:
+            if not self.owns(previous, observed):
+                raise PiccoloError("Existing target identity changed")
+            return
+        from gcp_live_support.manifest import resource_key
+
+        self.manifest.put(
+            "external_resources",
+            {
+                "key": resource_key(kind, name),
+                "kind": kind,
+                "name": name,
+                "zone": "",
+                "id": text(observed, "id"),
+                "absent_before": False,
+                "preserve": True,
+            },
+        )
 
     def prepare(self, kind: str, name: str, zone: str, proof: Document) -> Document:
         """Require an absent target and persist its reservation before creation."""
@@ -163,6 +213,14 @@ class LiveCloud(SDKCloud):
         gate(self.project)
         resource_kind, verb = kind.split(".")
         if verb == "insert":
+            if resource_kind == "instance":
+                resource = document(resource)
+                metadata = document(resource.get("metadata", {}))
+                items = objects(metadata, "items")
+                if not any(text(item, "key") == "enable-oslogin" for item in items):
+                    items.append({"key": "enable-oslogin", "value": "TRUE"})
+                metadata["items"] = [item for item in items]
+                resource["metadata"] = metadata
             self.prepare(
                 resource_kind, name, zone, {"labels": resource.get("labels", {})}
             )
@@ -230,14 +288,26 @@ class LiveCloud(SDKCloud):
         kind = text(action, "kind")
         name = text(action, "name")
         zone = text(action, "zone")
-        if kind in {"account.create", "secret.create"}:
-            observed = self.get(kind.split(".")[0], name)
-            entry = self.manifest.lookup(kind.split(".")[0], name)
-            if observed is None or entry is None or not self.owns(entry, observed):
-                return False
-        elif kind in {"account.delete", "secret.delete"}:
-            if self.get(kind.split(".")[0], name) is not None:
-                return False
+        if kind in {
+            "account.create",
+            "secret.create",
+            "account.delete",
+            "secret.delete",
+        }:
+            resource_kind, verb = kind.split(".")
+            deadline = time.monotonic() + self.config.gcp.operation_timeout
+            while True:
+                observed = self.get(resource_kind, name)
+                if verb == "delete" and observed is None:
+                    break
+                if verb == "create" and observed is not None:
+                    entry = self.manifest.lookup(resource_kind, name)
+                    if entry is None or not self.owns(entry, observed):
+                        return False
+                    break
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(2)
         else:
             operation = text(action, "operation") or self.recover(
                 text(action, "key"), zone
@@ -289,6 +359,8 @@ class LiveCloud(SDKCloud):
     def delete(self, entry: Document) -> None:
         """Recheck ownership immediately and persist one bounded delete request."""
         gate(self.project)
+        if entry.get("preserve") is True:
+            raise PiccoloError("Existing policy targets cannot be deleted")
         kind, name, zone = (text(entry, k) for k in ("kind", "name", "zone"))
         observed = self.get(kind, name, zone)
         if observed is None:
@@ -540,7 +612,7 @@ class LiveAccess(Access):
             super().service_account()
         if self.cloud.manifest.lookup("account", name):
             for member in (
-                f"serviceAccount:{self.gcp.auth.impersonate_service_account}",
+                f"serviceAccount:{self.cloud.provisioner}",
                 f"user:{self.gcp.connection_account}",
             ):
                 self.cloud.binding(

@@ -203,6 +203,19 @@ def test_operation_error_is_structured_sdk_json() -> None:
     assert isinstance(failure(decoded), CapacityError)
 
 
+def test_poll_decodes_compute_enum_status_as_name(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients = Clients(AnonymousCredentials())
+    monkeypatch.setattr(
+        clients.global_operations,
+        "get",
+        Mock(return_value=compute_v1.Operation(status="DONE")),
+    )
+    assert SDKCloud(config, clients).poll("operation", "")["status"] == "DONE"
+
+
 def test_relocation_preserves_items_without_update_fingerprints(config: Config) -> None:
     source: Document = {
         "metadata": {

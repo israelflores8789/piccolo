@@ -123,7 +123,12 @@ class Manifest(Journal):
         """Find only an exactly registered resource."""
         key = resource_key(kind, name, zone)
         return next(
-            (r for r in self.entries("resources") if text(r, "key") == key), None
+            (
+                r
+                for r in self.entries("resources") + self.entries("external_resources")
+                if text(r, "key") == key
+            ),
+            None,
         )
 
     def register(self, kind: str, name: str, zone: str, proof: Document) -> Document:

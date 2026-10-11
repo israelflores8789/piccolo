@@ -164,6 +164,7 @@ class GCloudConnection:
                         "does not have permission",
                         "invalid choice",
                         "not found",
+                        "does not support ssh",
                     )
                 ):
                     raise PiccoloError(

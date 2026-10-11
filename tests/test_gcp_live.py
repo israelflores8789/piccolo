@@ -4,8 +4,10 @@
 """test_gcp_live.py — Explicitly opted-in real SDK lifecycle and human IAP checks.
 
 Set PICCOLO_GCP_LIVE_PROJECT to the approved TOML project before live tests.
+The impersonation case also requires PICCOLO_GCP_LIVE_HUMAN_ADC.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -14,11 +16,18 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from gcp_live_support.gcp_live import preflight, profile, run_config
+from gcp_live_support.gcp_live import (
+    local_preflight,
+    preflight,
+    profile,
+    provisioner_identity,
+    run_config,
+)
 from gcp_live_support.manifest import Manifest, cleanup, gate
 
 from piccolo.data import document, objects, text
@@ -43,7 +52,9 @@ def gcp_run(
     if not path:
         pytest.fail("Set PICCOLO_GCP_LIVE_CONFIG to the approved local TOML profile")
     base = profile(Path(path))
+    local_preflight()
     from gcp_live_support.gcp_sdk import LiveCloud
+    from google.cloud import service_usage_v1
 
     from piccolo.providers.gcp.auth import credentials
     from piccolo.providers.gcp.clients import Clients
@@ -67,7 +78,17 @@ def gcp_run(
         if os.environ.get(variable):
             pytest.fail(f"Unset {variable} so gcloud uses the approved human account")
     with environment_lock(config):
-        cloud = LiveCloud(config, Clients(credentials(config.gcp)), manifest)
+        sdk_credentials = credentials(config.gcp)
+        clients = Clients(sdk_credentials)
+        clients.services = service_usage_v1.ServiceUsageClient(
+            credentials=sdk_credentials, transport="rest"
+        )
+        cloud = LiveCloud(
+            config,
+            clients,
+            manifest,
+            provisioner=provisioner_identity(sdk_credentials, config),
+        )
         provider = GCPProvider(config, cloud, GCloudConnection(config.gcp))
         try:
             preflight(config, cloud, GCloudConnection(config.gcp))
@@ -75,6 +96,8 @@ def gcp_run(
             if existing is None or existing.get("disabled") is True:
                 pytest.fail("Precreate and enable the approved VM service account")
             cloud.create_secret(f"{run}-dummy")
+            for secret in base.gcp.secrets:
+                cloud.preserve_external("secret", secret)
             yield provider
         finally:
             failures = cleanup(manifest, cloud, apply=True)
@@ -84,6 +107,77 @@ def gcp_run(
                     f"Retained manifest: {manifest.path}\n" + "\n".join(failures)
                 )
             print(f"Zero leftovers verified: {manifest.path}", flush=True)
+
+
+def test_human_source_provisioner_impersonation(tmp_path: Path) -> None:
+    """Exercise genuine human-to-provisioner tokens without any IAM mutation."""
+    gate(os.environ.get("PICCOLO_GCP_LIVE_PROJECT", ""))
+    base = profile(Path(os.environ["PICCOLO_GCP_LIVE_CONFIG"]))
+    from google.auth import impersonated_credentials
+    from google.cloud import resourcemanager_v3
+
+    from piccolo.providers.gcp.auth import credentials
+
+    direct = credentials(base.gcp)
+    target = provisioner_identity(direct, base)
+    adc = document(
+        json.loads(Path(os.environ["PICCOLO_GCP_LIVE_HUMAN_ADC"]).read_text())
+    )
+    source = document(adc.get("source_credentials", adc))
+    if source.get("type") != "authorized_user":
+        pytest.fail("Human impersonation source must be authorized_user credentials")
+    source_path = tmp_path / "human-source.json"
+    descriptor = os.open(source_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(source, stream)
+        config = replace(
+            base.gcp,
+            auth=replace(
+                base.gcp.auth,
+                mode="file",
+                credential_file=source_path,
+                impersonate_service_account=target,
+            ),
+        )
+        impersonated = credentials(config)
+        assert isinstance(impersonated, impersonated_credentials.Credentials)
+        assert provisioner_identity(impersonated, base) == target
+        project = resourcemanager_v3.ProjectsClient(
+            credentials=impersonated
+        ).get_project(name=f"projects/{base.gcp.project_id}", timeout=30)
+        assert project.project_id == base.gcp.project_id
+        print("Human-source provisioner impersonation verified; no IAM writes")
+    finally:
+        source_path.unlink(missing_ok=True)
+
+
+def verify_guest_secrets(provider: "GCPProvider", zone: str) -> None:
+    """Verify approved dummy payloads through the guest service account."""
+    connection = provider.connection
+    for secret in provider.gcp.secrets:
+        if secret.startswith(f"{provider.config.environment}-"):
+            continue
+        command = (
+            "python3 - <<'PY'\n"
+            "import json, urllib.request, hashlib\n"
+            "import base64\n"
+            "r = urllib.request.Request('http://metadata.google.internal/"
+            "computeMetadata/v1/instance/service-accounts/default/token', "
+            "headers={'Metadata-Flavor': 'Google'})\n"
+            "token = json.load(urllib.request.urlopen(r))['access_token']\n"
+            f"url = 'https://secretmanager.googleapis.com/v1/projects/"
+            f"{provider.gcp.project_id}/secrets/{secret}/versions/latest:access'\n"
+            "r = urllib.request.Request(url, "
+            "headers={'Authorization': 'Bearer ' + token})\n"
+            "payload = json.load(urllib.request.urlopen(r))['payload']['data']\n"
+            "print(hashlib.sha256(base64.b64decode(payload)).hexdigest())\nPY"
+        )
+        digest = connection.execute(zone, command)
+        import hashlib
+
+        assert digest == hashlib.sha256(b"TEST_thisisadummytestsecret_TEST").hexdigest()
+        print(f"Guest account accessed {secret}; payload verified without logging it")
 
 
 def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -> None:
@@ -111,6 +205,7 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
         for i in objects(document(instance.get("metadata", {})), "items")
     )
     connection = provider.connection
+    verify_guest_secrets(provider, zone)
     assert (
         connection.execute(zone, "test ! -e ~/piccolo-live-marker && printf absent")
         == "absent"
@@ -146,10 +241,18 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
     destination = next(
         z for z in provider.gcp.zones if z.rsplit("-", 1)[0] != zone.rsplit("-", 1)[0]
     )
-    provider.move(destination)
+    perform_move = not (
+        os.environ.get("PICCOLO_GCP_LIVE_MOVE_CASES") == "existing"
+        and provider.gcp.create_service_account
+    )
+    if perform_move:
+        provider.move(destination)
+    else:
+        destination = zone
+        print("Created-account case: relocation covered by existing-account case")
     moved = provider.active()
     assert zone_of(moved) == destination
-    assert text(moved, "id") != text(instance, "id")
+    assert (text(moved, "id") != text(instance, "id")) is perform_move
     assert connection.execute(destination, hash_command) == before
     assert connection.execute(destination, "wc -l < ~/piccolo-live-marker") == "1"
     assert text(provider.bootstrap(False, True), "status") == "completed"
@@ -180,6 +283,7 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
     zone = zone_of(provider.active())
     connection = GCloudConnection(provider.gcp)
     connection.ready(zone)
+    verify_guest_secrets(provider, zone)
     process: subprocess.Popen[bytes] | None = None
     try:
         connection.execute(
