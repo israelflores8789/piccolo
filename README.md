@@ -12,7 +12,8 @@ SPDX-License-Identifier: Apache-2.0
 <p align="center"><strong>A simple tool for setting up remote research environments</strong></p>
 
 <p align="center">
-  <!-- <a href="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml"><img src="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml/badge.svg" alt="CI status"></a> -->
+  <a href="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml"><img src="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://pypi.org/project/piccolo-stack/"><img src="https://img.shields.io/pypi/v/piccolo-stack.svg" alt="PyPI version"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-%E2%89%A53.12-blue.svg" alt="Python >=3.12"></a>
   <a href="https://github.com/israelflores8789/piccolo/blob/main/LICENSE"><img src="https://img.shields.io/github/license/israelflores8789/piccolo.svg" alt="License - Apache-2.0"></a>
 </p>
@@ -25,7 +26,7 @@ Infrastructure provisioning, explicit project setup, and daily connections are s
 ## Install
 
 ```bash
-pip install 'piccolo[gcp]'
+pip install 'piccolo-stack[gcp]'
 piccolo --help
 ```
 

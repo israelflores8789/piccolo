@@ -100,7 +100,7 @@ smoke:
 
 # Verify the wheel works without the optional GCP SDK dependencies.
 package-smoke:
-    uv run --isolated --no-project --with ./dist/piccolo-0.1.0-py3-none-any.whl piccolo validate --config examples/gcp/piccolo.toml
+    uv run --isolated --no-project --with ./dist/piccolo_stack-0.1.0a1-py3-none-any.whl piccolo validate --config examples/gcp/piccolo.toml
 
 clean:
     rm -rf dist/ build/ .pytest_cache/ .mypy_cache/ .ruff_cache/ .pyrefly/
