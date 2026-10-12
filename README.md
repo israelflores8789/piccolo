@@ -3,7 +3,20 @@ Copyright 2026 Israel Flores-Arbolay
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Piccolo
+<h1 align="center">Piccolo</h1>
+
+<p align="center">
+  <img src="media/piccolo-readme-banner-1200px.png" alt="Banner" width=1200 />
+</p>
+
+<p align="center"><strong>A simple tool for setting up remote research environments</strong></p>
+
+<p align="center">
+  <!-- <a href="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml"><img src="https://github.com/israelflores8789/piccolo/actions/workflows/ci.yml/badge.svg" alt="CI status"></a> -->
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-%E2%89%A53.12-blue.svg" alt="Python >=3.12"></a>
+  <a href="https://github.com/israelflores8789/piccolo/blob/main/LICENSE"><img src="https://img.shields.io/github/license/israelflores8789/piccolo.svg" alt="License - Apache-2.0"></a>
+</p>
+
 
 Piccolo provisions and manages one development VM per TOML configuration. Google Cloud infrastructure uses Google's Python SDKs; SSH, script transfer, and IAP tunnels use `gcloud`. Python 3.12 or newer is required; this repository develops with Python 3.13.
 
