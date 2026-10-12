@@ -6,13 +6,35 @@
 import hashlib
 
 from piccolo.config.models import Config
-from piccolo.data import Document, document, objects, text
+from piccolo.data import Document, Value, document, objects, text
 from piccolo.errors import PiccoloError
 
 
 def zone_of(instance: Document) -> str:
     """Return the zone basename from an observed resource."""
     return text(instance, "zone").rsplit("/", 1)[-1]
+
+
+def settings_match(observed: Value, expected: Value) -> bool:
+    """Compare requested settings, allowing read-only fields and URL prefixes."""
+    if isinstance(expected, dict):
+        return isinstance(observed, dict) and all(
+            settings_match(observed.get(key), value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(observed, list)
+            and len(observed) == len(expected)
+            and all(
+                any(settings_match(item, wanted) for item in observed)
+                for wanted in expected
+            )
+        )
+    if isinstance(expected, str) and expected.startswith(("projects/", "zones/")):
+        return isinstance(observed, str) and observed.endswith(expected)
+    if isinstance(expected, int) and not isinstance(expected, bool):
+        return str(observed) == str(expected)
+    return observed == expected
 
 
 def labels(config: Config, operation_id: str = "") -> Document:
@@ -71,9 +93,109 @@ def reject_startup(metadata: Document) -> None:
             )
 
 
+def supported_fields(resource: Document, fields: set[str], label: str) -> None:
+    """Reject unrecognized nondefault settings rather than discard them."""
+    for key, observed in resource.items():
+        if key not in fields and observed not in (None, "", 0, False, [], {}):
+            raise PiccoloError(f"Unsupported {label} setting: {key}")
+
+
 def validate_source(config: Config, instance: Document, disk: Document) -> None:
     """Reject unsupported VM settings rather than silently discard them in a move."""
-    boot_disk(instance)
+    supported_fields(
+        instance,
+        {
+            "name",
+            "id",
+            "kind",
+            "zone",
+            "self_link",
+            "creation_timestamp",
+            "status",
+            "status_message",
+            "cpu_platform",
+            "last_start_timestamp",
+            "last_stop_timestamp",
+            "last_suspended_timestamp",
+            "label_fingerprint",
+            "fingerprint",
+            "labels",
+            "machine_type",
+            "disks",
+            "network_interfaces",
+            "service_accounts",
+            "metadata",
+            "tags",
+            "description",
+            "shielded_instance_config",
+            "shielded_instance_integrity_policy",
+            "scheduling",
+            "reservation_affinity",
+            "can_ip_forward",
+            "min_cpu_platform",
+            "display_device",
+            "key_revocation_action_type",
+            "deletion_protection",
+            "satisfies_pzi",
+            "satisfies_pzs",
+        },
+        "source",
+    )
+    supported_fields(
+        disk,
+        {
+            "name",
+            "id",
+            "kind",
+            "zone",
+            "self_link",
+            "creation_timestamp",
+            "status",
+            "size_gb",
+            "type_",
+            "users",
+            "labels",
+            "label_fingerprint",
+            "description",
+            "architecture",
+            "guest_os_features",
+            "licenses",
+            "license_codes",
+            "physical_block_size_bytes",
+            "source_image",
+            "source_image_id",
+            "source_snapshot",
+            "source_snapshot_id",
+            "last_attach_timestamp",
+            "last_detach_timestamp",
+            "satisfies_pzi",
+            "satisfies_pzs",
+            "contents",
+        },
+        "source disk",
+    )
+    attachment = boot_disk(instance)
+    supported_fields(
+        attachment,
+        {
+            "boot",
+            "source",
+            "auto_delete",
+            "type_",
+            "device_name",
+            "mode",
+            "interface",
+            "index",
+            "kind",
+            "disk_size_gb",
+            "guest_os_features",
+            "licenses",
+            "architecture",
+        },
+        "boot attachment",
+    )
+    if attachment.get("mode", "READ_WRITE") != "READ_WRITE":
+        raise PiccoloError("Unsupported read-only boot disk")
     reject_startup(document(instance.get("metadata", {})))
     if instance.get("deletion_protection"):
         raise PiccoloError(
@@ -108,6 +230,29 @@ def validate_source(config: Config, instance: Document, disk: Document) -> None:
     if len(nics) != 1:
         raise PiccoloError("v1 supports exactly one IPv4 network interface")
     nic = nics[0]
+    supported_fields(
+        nic,
+        {
+            "name",
+            "kind",
+            "fingerprint",
+            "network",
+            "subnetwork",
+            "network_i_p",
+            "access_configs",
+            "stack_type",
+            "nic_type",
+        },
+        "network interface",
+    )
+    for access in objects(nic, "access_configs"):
+        supported_fields(
+            access,
+            {"name", "kind", "type_", "nat_i_p", "network_tier"},
+            "access configuration",
+        )
+        if access.get("type_", "ONE_TO_ONE_NAT") != "ONE_TO_ONE_NAT":
+            raise PiccoloError("Unsupported external access type")
     if (
         nic.get("alias_ip_ranges")
         or nic.get("ipv6_access_configs")
@@ -118,6 +263,16 @@ def validate_source(config: Config, instance: Document, disk: Document) -> None:
     if len(objects(nic, "access_configs")) > 1:
         raise PiccoloError("Unsupported external access configuration")
     scheduling = document(instance.get("scheduling", {}))
+    supported_fields(
+        scheduling,
+        {
+            "automatic_restart",
+            "on_host_maintenance",
+            "provisioning_model",
+            "preemptible",
+        },
+        "scheduling",
+    )
     if (
         scheduling.get("provisioning_model", "STANDARD") != "STANDARD"
         or scheduling.get("preemptible")
@@ -229,6 +384,7 @@ def instance_resource(
             "provisioning_model": "STANDARD",
         },
         "reservation_affinity": {"consume_reservation_type": "NO_RESERVATION"},
+        "metadata": {"items": [{"key": "enable-guest-attributes", "value": "TRUE"}]},
     }
     if source:
         for key in (

@@ -22,6 +22,7 @@ from piccolo.providers.gcp.provision import (
     labels,
     owned,
     reject_startup,
+    settings_match,
     validate_source,
     zone_of,
 )
@@ -62,13 +63,43 @@ class GCPProvider:
             else SDKCloud(config, Clients(credentials(config.gcp)))
         )
         self.connection = (
-            connection if connection is not None else GCloudConnection(config.gcp)
+            connection
+            if connection is not None
+            else GCloudConnection(
+                config.gcp, self.connection_target, self.cloud.host_keys
+            )
         )
         self.journal = Journal(config)
+        if isinstance(self.cloud, SDKCloud):
+            self.cloud.journal = self.journal
         self.notify = notify
         self.operations = Operations(
             self.cloud, self.journal, self.gcp.operation_timeout, notify
         )
+
+    def connection_target(self, zone: str) -> Document:
+        """Bind host enrollment to the recorded active or replacement ID."""
+        instance = self.cloud.get("instance", self.gcp.name, zone)
+        operation = self.journal.operation
+        expected = text(self.journal.data, "active_instance_id")
+        for artifact in objects(operation, "artifacts"):
+            if artifact.get("kind") == "instance" and artifact.get("zone") == zone:
+                expected = text(artifact, "id")
+        if instance is None or not expected or text(instance, "id") != expected:
+            raise PiccoloError(
+                "Connection target differs from the recorded instance identity"
+            )
+        self.check_owner(instance)
+        expected_disk = text(self.journal.data, "active_disk_id")
+        for artifact in objects(operation, "artifacts"):
+            if artifact.get("kind") == "disk" and artifact.get("zone") == zone:
+                expected_disk = text(artifact, "id")
+        if expected_disk and text(self.disk(instance), "id") != expected_disk:
+            raise PiccoloError(
+                "Connection boot disk differs from its recorded identity"
+            )
+        self.cloud.connection_policy(instance)
+        return instance
 
     def instances(self) -> list[Document]:
         """Discover all instances with the configured name across every zone."""
@@ -199,6 +230,7 @@ class GCPProvider:
                     "Existing VM differs; init will not rebuild it: " + "; ".join(drift)
                 )
             self.safe_start(instance)
+            self.journal.data["active_disk_id"] = text(self.disk(instance), "id")
             self.journal.data["active_instance_id"] = text(instance, "id")
             self.journal.data["active_zone"] = zone_of(instance)
             self.journal.begin(
@@ -269,6 +301,35 @@ class GCPProvider:
                 f"Created {kind} cannot be verified; preserve "
                 f"the operation and run resume"
             )
+        action = next(
+            item
+            for item in objects(operation, "actions")
+            if item.get("key") == f"{kind}.insert:{zone}:{name}"
+        )
+        target_id = text(action, "target_id")
+        if not target_id or text(observed, "id") != target_id:
+            raise PiccoloError(
+                "Created resource differs from the Compute operation "
+                "target ID; retained"
+            )
+        if not settings_match(observed, resource):
+            raise PiccoloError(
+                "Created resource settings differ from the request; retained"
+            )
+        if kind == "snapshot":
+            original = document(operation.get("source_disk", {}))
+            if text(observed, "source_disk_id") != text(original, "id") or not text(
+                observed, "source_disk"
+            ).endswith(text(resource, "source_disk")):
+                raise PiccoloError("Snapshot source disk identity differs; retained")
+        if kind == "disk" and resource.get("source_snapshot"):
+            snapshot = self.cloud.get("snapshot", text(operation, "snapshot"))
+            if snapshot is None or text(observed, "source_snapshot_id") != text(
+                snapshot, "id"
+            ):
+                raise PiccoloError(
+                    "Replacement disk snapshot identity differs; retained"
+                )
         expected = "RUNNING" if kind == "instance" else "READY"
         if text(observed, "status") != expected:
             raise PiccoloError(
@@ -321,6 +382,13 @@ class GCPProvider:
             )
             original_disk = document(operation["source_disk"])
             disk_resource["size_gb"] = original_disk["size_gb"]
+            for key in ("description", "architecture"):
+                if original_disk.get(key):
+                    disk_resource[key] = original_disk[key]
+            disk_resource["labels"] = {
+                **document(original_disk.get("labels", {})),
+                **labels(self.config, operation_id),
+            }
         else:
             disk_resource["source_image"] = self.gcp.image
         disk = self.created("disk", disk_name, zone, disk_resource)
@@ -329,12 +397,47 @@ class GCPProvider:
             "self_link",
             f"projects/{self.gcp.project_id}/zones/{zone}/disks/{disk_name}",
         )
-        return self.created(
+        instance = self.created(
             "instance",
             self.gcp.name,
             zone,
             instance_resource(self.config, zone, link, subnet, operation_id, source),
         )
+
+        observed_disk = self.disk(instance)
+        if text(observed_disk, "id") != text(disk, "id"):
+            raise PiccoloError("Created disk changed before attachment verification")
+        self.verify_attachment(instance, observed_disk)
+        return instance
+
+    def verify_attachment(self, instance: Document, disk: Document) -> None:
+        """Require the independently recorded disk ID and exact VM attachment."""
+        recorded = next(
+            (
+                item
+                for item in objects(self.journal.operation, "artifacts")
+                if item.get("kind") == "disk"
+                and item.get("zone") == zone_of(instance)
+                and item.get("name") == text(disk, "name")
+            ),
+            None,
+        )
+        attached = boot_disk(instance)
+        link = text(disk, "self_link")
+        if (
+            recorded is None
+            or text(recorded, "id") != text(disk, "id")
+            or not link
+            or text(attached, "source") != link
+        ):
+            raise PiccoloError(
+                "Created boot disk identity or attachment differs; "
+                "bootstrap and commit blocked"
+            )
+        if disk.get("users") != [text(instance, "self_link")]:
+            raise PiccoloError(
+                "Created boot disk users differ; bootstrap and commit blocked"
+            )
 
     def choose(self, source: Document | None = None) -> Document:
         """Try only confirmed capacity failures and block ambiguous duplicate."""
@@ -405,8 +508,10 @@ class GCPProvider:
         reject_startup(self.cloud.project_metadata())
         replacement = self.choose()
         disk = self.disk(replacement)
+        self.verify_attachment(replacement, disk)
         self.journal.data["active_instance_id"] = text(replacement, "id")
         self.journal.data["active_zone"] = zone_of(replacement)
+        self.journal.data["active_disk_id"] = text(disk, "id")
         self.journal.data["fresh_disk_id"] = text(disk, "id")
         self.journal.data["image"] = self.gcp.image
         operation = self.journal.operation
@@ -418,6 +523,7 @@ class GCPProvider:
             self.connection,
             zone_of(replacement),
             text(disk, "id"),
+            verify=lambda: self.connection_target(zone_of(replacement)),
         )
         self.journal.finish()
         self.notify("Infrastructure ready; bootstrap execution remains explicit")
@@ -492,6 +598,7 @@ class GCPProvider:
             raise PiccoloError("Source must be RUNNING or TERMINATED")
         disk = self.disk(source)
         validate_source(self.config, source, disk)
+        self.cloud.move_policy(source, disk)
         self.safe_start(source)
         zones = (
             [destination]
@@ -552,6 +659,7 @@ class GCPProvider:
         if text(disk, "id") != text(original_disk, "id"):
             raise PiccoloError("Source boot disk identity changed")
         validate_source(self.config, source, disk)
+        self.cloud.move_policy(source, disk)
         self.operations.run(
             "protect-source",
             "instance.protect",
@@ -601,9 +709,11 @@ class GCPProvider:
         ):
             raise PiccoloError("Replacement changed during readiness verification")
         self.check_owner(verified)
+        self.verify_attachment(verified, self.disk(verified))
         operation["committed"] = True
         operation["stage"] = "committed"
         self.journal.data["active_instance_id"] = text(replacement, "id")
+        self.journal.data["active_disk_id"] = text(self.disk(verified), "id")
         self.journal.data["active_zone"] = zone_of(replacement)
         self.journal.update(operation)
         self.commit_cleanup()
@@ -650,6 +760,19 @@ class GCPProvider:
             )
         snapshot = self.cloud.get("snapshot", text(operation, "snapshot"))
         if snapshot:
+            recorded_snapshot = next(
+                (
+                    item
+                    for item in objects(operation, "artifacts")
+                    if item.get("kind") == "snapshot"
+                    and item.get("name") == text(snapshot, "name")
+                ),
+                None,
+            )
+            if recorded_snapshot is None or text(snapshot, "id") != text(
+                recorded_snapshot, "id"
+            ):
+                raise PiccoloError("Recovery snapshot identity changed; retained")
             if not owned(self.config, snapshot, text(operation, "id")):
                 raise PiccoloError("Recovery snapshot ownership changed; retained")
             self.operations.run(
@@ -852,4 +975,5 @@ class GCPProvider:
             text(self.disk(instance), "id"),
             dry_run=dry_run,
             status=status,
+            verify=lambda: self.connection_target(zone_of(instance)),
         )

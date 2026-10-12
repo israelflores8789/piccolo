@@ -3,6 +3,7 @@
 
 """conftest.py — Isolated configuration, fake cloud, and local guest fixtures."""
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -110,6 +111,10 @@ class FakeCloud:
         else:
             self.operations[operation_id] = {"status": "DONE"}
             self.mutate(kind, name, zone, resource)
+            if kind.endswith(".insert"):
+                self.operations[operation_id]["target_id"] = self.resources[
+                    (kind.split(".")[0], name, zone)
+                ]["id"]
         if (kind, zone) in self.lost_response:
             self.lost_response.remove((kind, zone))
             raise UncertainError("Injected disconnect after cloud acceptance")
@@ -137,6 +142,9 @@ class FakeCloud:
                 created["users"] = []
                 snapshot_name = text(created, "source_snapshot").split("/")[-1]
                 if snapshot_name:
+                    created["source_snapshot_id"] = self.resources[
+                        ("snapshot", snapshot_name, "")
+                    ]["id"]
                     created["contents"] = self.resources[
                         ("snapshot", snapshot_name, "")
                     ].get("contents", "")
@@ -152,6 +160,9 @@ class FakeCloud:
                     self.resources[("instance", "test-vm", source_zone)]["status"]
                     == "TERMINATED"
                 )
+                created["source_disk_id"] = self.resources[
+                    ("disk", source_disk, source_zone)
+                ]["id"]
                 created["contents"] = self.resources[
                     ("disk", source_disk, source_zone)
                 ].get("contents", "")
@@ -190,6 +201,19 @@ class FakeCloud:
         region = zone.rsplit("-", 1)[0]
         return f"projects/test-project/regions/{region}/subnetworks/default"
 
+    def move_policy(self, instance: Document, disk: Document) -> None:
+        pass
+
+    def connection_policy(self, instance: Document) -> None:
+        pass
+
+    def host_keys(self, zone: str) -> Document:
+        del zone
+        return {}
+
+    def permission_denied(self, kind: str, detail: str = "") -> PiccoloError:
+        return PiccoloError(f"GCP permission denied for {kind}: {detail}")
+
     def project_metadata(self) -> Document:
         return self.metadata
 
@@ -220,6 +244,7 @@ class GuestConnection:
             capture_output=True,
             check=False,
             timeout=timeout,
+            env={**os.environ, "HOME": str(self.directory)},
         )
         if result.returncode:
             raise PiccoloError(result.stderr.strip())
@@ -229,12 +254,7 @@ class GuestConnection:
         self.copy_zones.append(zone)
         target = self.directory / destination
         target.parent.mkdir(parents=True, exist_ok=True)
-        if destination.endswith(".runner.sh"):
-            target.write_text(
-                source.read_text().replace('"$HOME"', shlex.quote(str(self.directory)))
-            )
-        else:
-            shutil.copyfile(source, target)
+        shutil.copyfile(source, target)
         self.copies += 1
 
     def shell(self, zone: str) -> None:

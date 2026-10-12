@@ -199,6 +199,10 @@ class CleanupBackend(Protocol):
         """Remove only this run's added member from a freshly read IAM policy."""
         ...
 
+    def remove_ssh_key(self, entry: Document) -> None:
+        """Remove only an independently recorded disposable connection key."""
+        ...
+
 
 def cleanup(
     manifest: Manifest, backend: CleanupBackend, *, apply: bool = False
@@ -271,6 +275,12 @@ def cleanup(
                     raise PiccoloError("Deletion not verified")
             except Exception as exc:
                 failures.append(f"{label}: {exc}")
+    if not failures:
+        for entry in manifest.entries("ssh_keys"):
+            try:
+                backend.remove_ssh_key(entry)
+            except Exception as exc:
+                failures.append(f"SSH key {text(entry, 'key')}: {exc}")
     # Prefix discovery reports strays but never authorizes deletion by name alone.
     run = text(manifest.data, "run")
     for kind in RESOURCE_KINDS:

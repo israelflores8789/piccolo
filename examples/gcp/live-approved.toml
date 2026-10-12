@@ -48,6 +48,8 @@ project_roles = []
 user = "REPLACE_posix_username"
 account = "REPLACE-human@example.com"
 via_iap = true
+require_passphrase = false
+expire-after = "24h"
 readiness_timeout = 300
 
 [gcp.tunnel]

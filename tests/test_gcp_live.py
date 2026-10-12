@@ -83,7 +83,7 @@ def gcp_run(
             manifest,
             provisioner=provisioner_identity(sdk_credentials, config),
         )
-        provider = GCPProvider(config, cloud, GCloudConnection(config.gcp))
+        provider = GCPProvider(config, cloud)
         try:
             preflight(config, cloud, GCloudConnection(config.gcp))
             existing = cloud.get("account", base.gcp.service_account)
@@ -268,6 +268,31 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
     print(f"Sentinel hashes preserved:\n{before}")
 
 
+@pytest.mark.parametrize("mode", ["oslogin", "metadata"])
+@pytest.mark.parametrize("transport", ["ssh", "scp"])
+def test_live_ssh_key_expire_and_reconnect(
+    gcp_run: "GCPProvider", mode: str, transport: str
+) -> None:
+    """Prove expired-key rejection, then gcloud renewal on SSH and SCP reconnect."""
+    from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.ssh_expiry import SSHExpiryProbe
+
+    from piccolo.providers.gcp.provider import GCPProvider
+
+    assert isinstance(gcp_run.cloud, LiveCloud)
+    gcp_run.cloud.ssh_login_mode = mode
+    provider = GCPProvider(replace(gcp_run.config, bootstrap=None), gcp_run.cloud)
+    provider.init()
+    probe = SSHExpiryProbe(provider, mode, transport)
+    initial = probe.establish()
+    probe.wait_until_rejected(initial[1])
+    probe.reconnect(initial)
+    print(
+        f"Verified {mode}/{transport}: key rejected after expiry, "
+        "then reauthorized with the same public key"
+    )
+
+
 def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
     from piccolo.providers.gcp.connection import GCloudConnection
     from piccolo.providers.gcp.provision import zone_of
@@ -275,7 +300,9 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
     provider = gcp_run
     provider.init()
     zone = zone_of(provider.active())
-    connection = GCloudConnection(provider.gcp)
+    connection = GCloudConnection(
+        provider.gcp, provider.connection_target, provider.cloud.host_keys
+    )
     connection.ready(zone)
     verify_guest_secrets(provider, zone)
     process: subprocess.Popen[bytes] | None = None
@@ -370,7 +397,7 @@ def test_live_gcloud_persisted_overrides_are_rejected(
     monkeypatch.delenv("CLOUDSDK_ACTIVE_CONFIG_NAME", raising=False)
     connection = GCloudConnection(base.gcp)
     with pytest.raises(PiccoloError, match=property_name):
-        connection.execute(base.gcp.zones[0], "true")
+        connection.environment()
 
 
 def test_live_credential_guards_before_guest_access(
@@ -390,7 +417,9 @@ def test_live_credential_guards_before_guest_access(
     for variable in AUTH_OVERRIDES:
         with monkeypatch.context() as injection:
             injection.setenv(variable, "unauthorized-test-value")
-            connection = GCloudConnection(provider.gcp)
+            connection = GCloudConnection(
+                provider.gcp, provider.connection_target, provider.cloud.host_keys
+            )
             with pytest.raises(PiccoloError, match=variable):
                 connection.execute(zone, "true")
             with pytest.raises(PiccoloError, match=variable):
@@ -453,7 +482,6 @@ def test_live_later_fallback_recovery(
     """
     from gcp_live_support.gcp_sdk import LiveCloud
 
-    from piccolo.providers.gcp.connection import GCloudConnection
     from piccolo.providers.gcp.provider import GCPProvider
     from piccolo.providers.gcp.provision import zone_of
 
@@ -519,7 +547,7 @@ def test_live_later_fallback_recovery(
         for item in cloud.manifest.entries("actions")
         if text(item, "kind").endswith(".insert")
     ]
-    recovered = GCPProvider(provider.config, cloud, GCloudConnection(provider.gcp))
+    recovered = GCPProvider(provider.config, cloud)
     recovered.resume()
     assert zone_of(recovered.active()) == accepted_zone
     assert not recovered.journal.operation

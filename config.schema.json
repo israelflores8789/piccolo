@@ -291,7 +291,8 @@
         },
         "external_ip": {
           "type": "boolean",
-          "default": true
+          "default": false,
+          "description": "Explicitly opt into public addressing; private VMs need an operator-provided egress route for downloads."
         }
       }
     },
@@ -329,7 +330,7 @@
           "default": [
             "35.235.240.0/20"
           ],
-          "description": "IPv4 CIDR ranges. Piccolo also verifies that each address is a canonical network address."
+          "description": "Canonical IPv4 CIDRs contained in the IAP range 35.235.240.0/20; containment is verified by Piccolo."
         }
       }
     },
@@ -358,7 +359,8 @@
             "type": "string",
             "pattern": "^(?:roles/[A-Za-z0-9_.]+|projects/[a-z0-9-]+/roles/[A-Za-z0-9_.]+)$"
           },
-          "default": []
+          "default": [],
+          "description": "Additive guest roles; Piccolo rejects basic/admin/delegation privileges and conditional-only widening."
         }
       }
     },
@@ -394,6 +396,21 @@
         "readiness_command": {
           "type": "string",
           "default": ""
+        },
+        "internal_ip": {
+          "type": "boolean",
+          "default": false
+        },
+        "require_passphrase": {
+          "type": "boolean",
+          "default": false,
+          "description": "Forward gcloud key-generation prompts in an interactive terminal; existing encrypted keys may need the SSH agent."
+        },
+        "expire-after": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,5}[smhd]$",
+          "default": "24h",
+          "description": "Finite published SSH-key access requested from gcloud for SSH and SCP; does not terminate an existing session."
         }
       }
     },
@@ -430,8 +447,9 @@
         "remote_path": {
           "type": "string",
           "minLength": 1,
-          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!\\.$)[A-Za-z0-9_./-]+$",
-          "default": ".piccolo/bootstrap/setup.sh"
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)attempt-)(?!.*\\.upload-)(?!.*\\.runner\\.sh$)(?!.*//)(?!.*(?:^|/)\\.(?:/|$))(?!.*[/]$)[A-Za-z0-9_./-]+$",
+          "default": ".piccolo/bootstrap/setup.sh",
+          "description": "Canonical home-relative artifact path; receipt, upload and runner names are reserved."
         },
         "execution_user": {
           "type": "string",
@@ -446,5 +464,6 @@
         }
       }
     }
-  }
+  },
+  "$comment": "Copyright 2026 Israel Flores-Arbolay; SPDX-License-Identifier: Apache-2.0"
 }

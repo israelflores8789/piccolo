@@ -4,13 +4,19 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-pytest := "uv run pytest"
+pytest := "uv run --locked pytest"
 src_dir := "src"
 check_dirs := "src tests"
 
+lock:
+    uv lock
+
+lock-check:
+    uv lock --check
+
 install-dev:
     @echo "Installing development dependencies..."
-    @uv sync --all-groups --all-extras
+    @uv sync --locked --all-groups --all-extras
 
 test *args:
     {{pytest}} -v -s {{args}}
@@ -37,18 +43,18 @@ janitor-gcp-live manifest apply="0":
         *) echo "apply must be 0 or 1" >&2; exit 2 ;;
     esac
     PICCOLO_GCP_LIVE=1 \
-        uv run python tests/gcp_janitor.py --manifest "{{ manifest }}" "${args[@]}"
+        uv run --locked python tests/gcp_janitor.py --manifest "{{ manifest }}" "${args[@]}"
 
 coverage *args:
-    uv run --with pytest-cov pytest --cov=src/piccolo --cov-report=term-missing {{args}}
+    uv run --locked pytest --cov=src/piccolo --cov-report=term-missing {{args}}
 
 lint:
     #!/usr/bin/env bash
     set -u
     status=0
 
-    uv run ruff check {{check_dirs}} || status=1
-    uv run ruff format --check {{check_dirs}} || status=1
+    uv run --locked ruff check {{check_dirs}} || status=1
+    uv run --locked ruff format --check {{check_dirs}} || status=1
 
     exit "$status"
 
@@ -57,36 +63,36 @@ lint-yaml:
     set -u
     status=0
 
-    uv run pre-commit run --all-files actionlint || status=1
-    uv run pre-commit run --all-files check-yaml || status=1
+    uv run --locked pre-commit run --all-files actionlint || status=1
+    uv run --locked pre-commit run --all-files check-yaml || status=1
 
     exit "$status"
 
 lint-fix:
-    uv run ruff format {{check_dirs}}
-    uv run ruff check --fix {{check_dirs}}
-    uv run ruff format {{check_dirs}}
+    uv run --locked ruff format {{check_dirs}}
+    uv run --locked ruff check --fix {{check_dirs}}
+    uv run --locked ruff format {{check_dirs}}
 
 typecheck:
-    uv run pyrefly check {{src_dir}} tests/gcp_live_support
+    uv run --locked pyrefly check {{src_dir}} tests/gcp_live_support
 
 spell-diff:
     uvx --from typos typos --diff
 
 ci: test lint typecheck
 
-build:
+build: lock-check
     @echo "Building the project..."
     rm -rf dist/
     uv build --no-sources
 
 check-dist: build
-    uv run twine check --strict dist/*
+    uv run --locked twine check --strict dist/*
 
 # Local command checks without cloud credentials or API requests.
 smoke:
-    uv run piccolo --help
-    uv run piccolo validate --config examples/gcp/piccolo.toml
+    uv run --locked piccolo --help
+    uv run --locked piccolo validate --config examples/gcp/piccolo.toml
 
 # Verify the wheel works without the optional GCP SDK dependencies.
 package-smoke:
@@ -101,13 +107,13 @@ clean:
 install: install-dev
 
 format:
-    uv run ruff format {{src_dir}}
+    uv run --locked ruff format {{src_dir}}
 
 format-check:
-    uv run ruff format --check {{src_dir}}
+    uv run --locked ruff format --check {{src_dir}}
 
 pre-commit-install:
-    uv run pre-commit install
+    uv run --locked pre-commit install
 
 pre-commit:
-    uv run pre-commit run --all-files
+    uv run --locked pre-commit run --all-files

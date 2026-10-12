@@ -54,6 +54,22 @@ class Cloud(Protocol):
         """Resolve and validate a regional subnet for a candidate zone."""
         ...
 
+    def move_policy(self, instance: Document, disk: Document) -> None:
+        """Reject separately attached policies and tags that cannot be preserved."""
+        ...
+
+    def connection_policy(self, instance: Document) -> None:
+        """Inspect effective ingress before permitting a connection."""
+        ...
+
+    def host_keys(self, zone: str) -> Document:
+        """Read host public keys through the authenticated Compute API."""
+        ...
+
+    def permission_denied(self, kind: str, detail: str = "") -> PiccoloError:
+        """Return IAM binding guidance for the acting provisioner and action."""
+        ...
+
     def project_metadata(self) -> Document:
         """Inspect inherited startup metadata."""
         ...
@@ -183,6 +199,16 @@ class Operations:
                         f"{text(warning, 'message')}"
                     )
                 error = failure(result)
+                if error and (
+                    result.get("http_error_status_code") == 403
+                    or any(
+                        text(item, "code")
+                        in {"PERMISSIONS_ERROR", "PERMISSION_DENIED", "FORBIDDEN"}
+                        for item in objects(document(result.get("error", {})), "errors")
+                    )
+                ):
+                    error = self.cloud.permission_denied(kind, str(error))
+                action["target_id"] = str(result.get("target_id", ""))
                 action["status"] = "failed" if error else "done"
                 if error:
                     action["error"] = str(error)

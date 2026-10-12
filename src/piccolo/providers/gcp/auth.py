@@ -107,6 +107,14 @@ def credentials(config: GCP) -> Credentials:
             if path is not None
             else compute_engine.Credentials(scopes=SCOPES)
         )
+        source_principal: object = getattr(source, "service_account_email", "")
+        principal = config.auth.impersonate_service_account or (
+            source_principal if isinstance(source_principal, str) else ""
+        )
+        if principal == config.service_account:
+            raise PiccoloError(
+                "The provisioner identity must differ from the guest service account"
+            )
         if config.auth.impersonate_service_account:
             return impersonated_credentials.Credentials(
                 source_credentials=source,

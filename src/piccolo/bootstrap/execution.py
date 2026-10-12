@@ -6,9 +6,10 @@
 import hashlib
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from piccolo.bootstrap.staging import home_path
+from piccolo.bootstrap.staging import home_path, private_path, upload
 from piccolo.config.models import Config
 from piccolo.data import Document, document, text
 from piccolo.errors import PiccoloError, UncertainError
@@ -49,6 +50,7 @@ def execute(
     *,
     dry_run: bool = False,
     status: bool = False,
+    verify: Callable[[], Document] | None = None,
 ) -> Document:
     """Launch only an explicitly authorized first attempt and retain uncertainty."""
     setup = config.bootstrap
@@ -89,7 +91,10 @@ def execute(
             "Bootstrap target configuration differs from the staged artifact"
         )
     connection.ready(zone)
+    if verify is not None:
+        verify()
     script = home_path(text(record, "remote_path"))
+    connection.execute(zone, private_path(text(record, "remote_path")))
     digest = connection.execute(zone, f"sha256sum {script}").split()[0]
     if digest != text(record, "digest"):
         raise PiccoloError("Staged bootstrap digest changed; refusing execution")
@@ -102,7 +107,12 @@ def execute(
 
 umask 077
 attempt={attempt}
-bash {script}
+{private_path(text(record, "remote_path"))}
+exec 3< {script}
+expected={text(record, "digest")}
+test "$(sha256sum /proc/self/fd/3 | cut -d ' ' -f1)" = "$expected" || exit 125
+set +e
+bash /proc/self/fd/3
 rc=$?
 printf '%s\\n' "$rc" > "$attempt/exit-code.tmp"
 mv "$attempt/exit-code.tmp" "$attempt/exit-code"
@@ -111,7 +121,8 @@ exit "$rc"
     with tempfile.TemporaryDirectory(prefix="piccolo-bootstrap-") as temporary:
         local = Path(temporary) / "runner.sh"
         local.write_text(wrapper)
-        connection.copy(zone, local, runner)
+        runner_digest = hashlib.sha256(local.read_bytes()).hexdigest()
+        upload(connection, zone, local, runner, runner_digest)
     record["status"] = "started"
     record["authorized_at"] = time.time()
     record["log_path"] = f"{attempt_path}/output.log"
@@ -121,8 +132,12 @@ exit "$rc"
         connection.execute(
             zone,
             (
-                f"umask 077; mkdir {attempt} && (nohup bash "
-                f"{home_path(runner)} >{attempt}/output.log "
+                private_path(runner) + "; " + f"exec 4< {home_path(runner)}; "
+                f"test \"$(sha256sum /proc/self/fd/4 | cut -d ' ' -f1)\" = "
+                f"{runner_digest}; "
+                f"umask 077; test ! -L {attempt}; "
+                f"mkdir -m 700 {attempt} && (nohup bash "
+                f"/proc/self/fd/4 >{attempt}/output.log "
                 f"2>&1 </dev/null &)"
             ),
         )

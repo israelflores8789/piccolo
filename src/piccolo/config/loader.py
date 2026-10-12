@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 from piccolo.config.discovery import discover
-from piccolo.config.models import GCP, Auth, Bootstrap, Config
+from piccolo.config.models import GCP, Auth, Bootstrap, Config, privileged_role
 from piccolo.data import Document, Value, document
 from piccolo.errors import PiccoloError
 
@@ -170,7 +170,7 @@ def load(path: Path | None = None) -> Config:
         subnets[named(region, "gcp.network.subnets")] = named(
             subnet_name, "gcp.network.subnets"
         )
-    external = network.boolean("external_ip", True)
+    external = network.boolean("external_ip", False)
     iap = cloud.section("iap")
     firewall = named(
         iap.string("firewall_name", f"{environment[:49]}-iap"), "gcp.iap.firewall_name"
@@ -188,8 +188,11 @@ def load(path: Path | None = None) -> Config:
         raise PiccoloError("gcp.iap.source_ranges: at least one CIDR is required")
     for cidr in ranges:
         try:
-            if ipaddress.ip_network(cidr).version != 4:
-                raise ValueError("IPv4 required")
+            parsed = ipaddress.ip_network(cidr)
+            if not isinstance(parsed, ipaddress.IPv4Network) or not parsed.subnet_of(
+                ipaddress.IPv4Network("35.235.240.0/20")
+            ):
+                raise ValueError("IAP source ranges must be within 35.235.240.0/20")
         except ValueError as exc:
             raise PiccoloError(f"gcp.iap.source_ranges: {exc}") from exc
     iam = cloud.section("iam")
@@ -207,11 +210,28 @@ def load(path: Path | None = None) -> Config:
             r"roles/[A-Za-z0-9_.]+|projects/[a-z0-9-]+/roles/[A-Za-z0-9_.]+", role
         ):
             raise PiccoloError("gcp.iam.project_roles: expected an IAM role name")
+        if privileged_role(role):
+            raise PiccoloError(
+                f"gcp.iam.project_roles: privileged role {role} is unsafe for a guest"
+            )
     enable_apis = cloud.boolean("enable_apis", False)
     operation_timeout = cloud.integer("operation_timeout", 600)
     ssh = cloud.section("ssh")
     user = named(ssh.string("user"), "gcp.ssh.user", r"[a-z_][a-z0-9_-]{0,31}")
     via_iap = ssh.boolean("via_iap", True)
+    internal_ip = ssh.boolean("internal_ip", False)
+    require_passphrase = ssh.boolean("require_passphrase", False)
+    expire_after = ssh.string("expire-after", "24h")
+    if not re.fullmatch(r"[1-9][0-9]{0,5}[smhd]", expire_after):
+        raise PiccoloError(
+            "gcp.ssh.expire-after: expected a finite positive duration such as 24h"
+        )
+    if via_iap and internal_ip:
+        raise PiccoloError("gcp.ssh: via_iap and internal_ip are mutually exclusive")
+    if not via_iap and not internal_ip and not external:
+        raise PiccoloError(
+            "gcp.ssh: direct connections require external_ip or internal_ip"
+        )
     connection_account = ssh.string("account", "")
     connection_impersonate = ssh.string("impersonate_service_account", "")
     readiness_timeout = ssh.integer("readiness_timeout", 300)
@@ -232,6 +252,10 @@ def load(path: Path | None = None) -> Config:
             or ".." in remote_parts.parts
             or not re.fullmatch(r"[A-Za-z0-9_./-]+", remote)
             or remote in {".", ""}
+            or str(remote_parts) != remote
+            or any(part.startswith("attempt-") for part in remote_parts.parts)
+            or ".upload-" in remote
+            or remote.endswith(".runner.sh")
         ):
             raise PiccoloError(
                 "bootstrap.remote_path: expected a safe path "
@@ -293,6 +317,9 @@ def load(path: Path | None = None) -> Config:
             remote_port,
             local_port,
             operation_timeout,
+            internal_ip,
+            require_passphrase,
+            expire_after,
         ),
         bootstrap,
         hashlib.sha256(source).hexdigest(),

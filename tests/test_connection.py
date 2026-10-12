@@ -17,6 +17,18 @@ from piccolo.errors import PiccoloError
 from piccolo.providers.gcp.connection import AUTH_OVERRIDES, GCloudConnection
 
 
+@pytest.fixture(autouse=True)
+def enrolled_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        GCloudConnection,
+        "host_options",
+        lambda _self, _zone, _flag: [
+            "--strict-host-key-checking=yes",
+            "--ssh-key-expire-after=24h",
+        ],
+    )
+
+
 def test_connection_uses_configured_user_project_and_iap(config: Config) -> None:
     connection = GCloudConnection(config.gcp)
     args = connection.ssh_arguments("us-west1-a", "true")

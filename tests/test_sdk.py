@@ -31,9 +31,9 @@ def test_instance_payload_can_be_encoded_by_sdk(config: Config) -> None:
     )
     instance = compute_v1.Instance(**payload)
     assert instance.disks[0].auto_delete is False
-    assert instance.network_interfaces[0].access_configs[0].type_ == "ONE_TO_ONE_NAT"
+    assert not instance.network_interfaces[0].access_configs
     assert instance.shielded_instance_config.enable_secure_boot
-    assert not instance.metadata.items
+    assert instance.metadata.items[0].key == "enable-guest-attributes"
 
 
 @pytest.mark.parametrize(
@@ -176,12 +176,22 @@ def test_iam_etag_conflict_rereads_policy(
     clients = Clients(AnonymousCredentials())
     policy = policy_pb2.Policy(version=3, etag=b"first")
     second = policy_pb2.Policy(version=3, etag=b"second")
-    getter = Mock(side_effect=[policy, second])
+    granted = policy_pb2.Policy(version=3, etag=b"third")
+    granted.bindings.add(
+        role="roles/viewer", members=[f"serviceAccount:{config.gcp.service_account}"]
+    )
+    getter = Mock(side_effect=[policy, policy, second, granted])
     setter = Mock(side_effect=[exceptions.Aborted("etag"), policy_pb2.Policy()])
     monkeypatch.setattr(clients.projects, "get_iam_policy", getter)
     monkeypatch.setattr(clients.projects, "set_iam_policy", setter)
-    Access(config, clients).grant("projects/test-project", "roles/viewer", secret=False)
-    assert getter.call_count == 2
+    from piccolo.state.journal import Journal
+
+    journal = Journal(config)
+    journal.begin({"kind": "access"})
+    Access(config, clients, journal).grant(
+        "projects/test-project", "roles/viewer", secret=False
+    )
+    assert getter.call_count == 4
     assert setter.call_args.kwargs["request"].policy.etag == b"second"
     assert getter.call_args.kwargs["request"].options.requested_policy_version == 3
 
@@ -274,6 +284,16 @@ def test_access_plan_reports_missing_resources_without_mutations(
     monkeypatch.setattr(clients.services, "enable_service", enable)
     monkeypatch.setattr(clients.firewalls, "insert", insert)
     monkeypatch.setattr(clients.iam, "create_service_account", create_account)
+    monkeypatch.setattr(
+        clients.networks,
+        "get_effective_firewalls",
+        Mock(return_value=compute_v1.NetworksGetEffectiveFirewallsResponse()),
+    )
+    monkeypatch.setattr(
+        clients.projects,
+        "get_iam_policy",
+        Mock(return_value=policy_pb2.Policy(version=3, etag=b"policy")),
+    )
     result = Access(config, clients).inspect()
     assert result["service_account"]["exists"] is False
     assert result["firewall"]["will_create"] is True

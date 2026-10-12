@@ -6,12 +6,14 @@
 import json
 
 from google.api_core import exceptions, retry
-from google.cloud import compute_v1
+from google.cloud import compute_v1, resourcemanager_v3
 
 from piccolo.config.models import Config
 from piccolo.data import Document, decode, text
 from piccolo.errors import PiccoloError, UncertainError
 from piccolo.providers.gcp.clients import Clients
+from piccolo.providers.gcp.permissions import permission_error
+from piccolo.state.journal import Journal
 
 READ_RETRY = retry.Retry(initial=1, maximum=8, deadline=30)
 
@@ -24,6 +26,7 @@ class SDKCloud:
         self.config = config
         self.clients = clients
         self.project = config.gcp.project_id
+        self.journal: Journal | None = None
 
     def get(self, kind: str, name: str, zone: str = "") -> Document | None:
         """Get one resource, treating only NotFound as absence."""
@@ -77,6 +80,12 @@ class SDKCloud:
                     raise PiccoloError(f"Unknown resource kind: {kind}")
         except exceptions.NotFound:
             return None
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise PiccoloError(f"Cannot inspect {kind} {name}: {exc}") from exc
 
@@ -141,8 +150,31 @@ class SDKCloud:
                     ]
                 case _:
                     raise PiccoloError(f"Unknown resource kind: {kind}")
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise PiccoloError(f"Cannot enumerate {kind}: {exc}") from exc
+
+    def permission_denied(self, kind: str, detail: str = "") -> PiccoloError:
+        """Describe missing provisioner roles and guest attachment rights."""
+        if "iam.serviceAccounts.actAs" in detail:
+            return permission_error(
+                self.clients.principal,
+                "roles/iam.serviceAccountUser",
+                f"projects/{self.project}/serviceAccounts/{self.config.gcp.service_account}",
+            )
+        role = (
+            "roles/compute.storageAdmin"
+            if kind.startswith(("disk.", "snapshot."))
+            else "roles/compute.instanceAdmin.v1"
+        )
+        return permission_error(
+            self.clients.principal, role, f"projects/{self.project}"
+        )
 
     def submit(
         self, kind: str, name: str, zone: str, resource: Document, request_id: str
@@ -239,9 +271,10 @@ class SDKCloud:
                 case _:
                     raise PiccoloError(f"Unknown mutation: {kind}")
             return str(operation.name)
+        except exceptions.Forbidden as exc:
+            raise self.permission_denied(kind, str(exc)) from exc
         except (
             exceptions.BadRequest,
-            exceptions.Forbidden,
             exceptions.Unauthorized,
             exceptions.NotFound,
             exceptions.Conflict,
@@ -274,6 +307,12 @@ class SDKCloud:
                     use_integers_for_enums=False,
                 )
             )
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise UncertainError(
                 f"Cannot inspect operation {name}; preserve resources: {exc}"
@@ -307,6 +346,12 @@ class SDKCloud:
                     "Multiple operations match a request ID; inspect manually"
                 )
             return names[0] if names else ""
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise UncertainError(f"Cannot reconcile submitted request: {exc}") from exc
 
@@ -314,7 +359,7 @@ class SDKCloud:
         """Ensure required APIs and additive access resources."""
         from piccolo.providers.gcp.access import Access
 
-        Access(self.config, self.clients).ensure()
+        Access(self.config, self.clients, self.journal).ensure()
 
     def access_plan(self) -> Document:
         """Report API, account, IAM, and firewall state without changing them."""
@@ -334,6 +379,12 @@ class SDKCloud:
                 retry=READ_RETRY,
                 timeout=30,
             )
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.networkViewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise PiccoloError(
                 f"Cannot resolve subnet {name} in {region}: {exc}"
@@ -345,12 +396,98 @@ class SDKCloud:
             raise PiccoloError("Only IPv4-only subnets are supported in v1")
         return result.self_link
 
+    def host_keys(self, zone: str) -> Document:
+        """Fetch host public keys from the guest agent through authenticated GCP."""
+        try:
+            result = self.clients.instances.get_guest_attributes(
+                request=compute_v1.GetGuestAttributesInstanceRequest(
+                    project=self.project,
+                    zone=zone,
+                    instance=self.config.gcp.name,
+                    query_path="hostkeys/",
+                ),
+                retry=READ_RETRY,
+                timeout=30,
+            )
+            return decode(
+                compute_v1.GuestAttributes.to_json(
+                    result, preserving_proto_field_name=True
+                )
+            )
+        except exceptions.NotFound:
+            return {}
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
+        except exceptions.GoogleAPICallError as exc:
+            raise PiccoloError(
+                f"Cannot enroll host public keys through Compute: {exc}"
+            ) from exc
+
+    def connection_policy(self, instance: Document) -> None:
+        """Require effective ingress to remain IAP scoped before SSH or SCP."""
+        from piccolo.providers.gcp.access import Access
+
+        policy = Access(self.config, self.clients).network_policy(instance)
+        if self.config.gcp.via_iap and policy.get("unsafe_ingress"):
+            raise PiccoloError(
+                "Effective firewall policy permits non-IAP ingress: "
+                f"{policy['unsafe_ingress']}"
+            )
+
+    def move_policy(self, instance: Document, disk: Document) -> None:
+        """Reject instance/disk tag bindings which snapshots do not preserve."""
+        from piccolo.providers.gcp.provision import zone_of
+
+        project = self.clients.projects.get_project(
+            name=f"projects/{self.project}", retry=READ_RETRY, timeout=30
+        )
+        zone = zone_of(instance)
+        client = resourcemanager_v3.TagBindingsClient(
+            credentials=self.clients.credentials,
+            client_options={
+                "api_endpoint": f"{zone}-cloudresourcemanager.googleapis.com"
+            },
+        )
+        try:
+            for kind, resource in (("instances", instance), ("disks", disk)):
+                parent = (
+                    f"//compute.googleapis.com/{project.name}/zones/{zone}/"
+                    f"{kind}/{text(resource, 'id')}"
+                )
+                if any(
+                    client.list_tag_bindings(
+                        parent=parent, retry=READ_RETRY, timeout=30
+                    )
+                ):
+                    raise PiccoloError(
+                        f"Unsupported source tag bindings on {kind}; "
+                        "inspect before relocation"
+                    )
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal, "roles/resourcemanager.tagViewer", project.name
+            ) from exc
+        except exceptions.GoogleAPICallError as exc:
+            raise PiccoloError(f"Cannot inspect source tag bindings: {exc}") from exc
+        finally:
+            client.transport.close()
+
     def project_metadata(self) -> Document:
         """Read project-wide startup metadata without enabling any hooks."""
         try:
             project = self.clients.compute_projects.get(
                 project=self.project, retry=READ_RETRY, timeout=30
             )
+        except exceptions.Forbidden as exc:
+            raise permission_error(
+                self.clients.principal,
+                "roles/compute.viewer",
+                f"projects/{self.project}",
+            ) from exc
         except exceptions.GoogleAPICallError as exc:
             raise PiccoloError(
                 f"Cannot inspect project startup metadata: {exc}"

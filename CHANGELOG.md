@@ -19,9 +19,15 @@ All notable changes to this project will be documented in this file. The format 
 - Explicitly gated GCP lifecycle and human IAP tests for the Piccolo GCP project, durable run manifests, an independent scoped janitor, and offline interruption/cleanup safety tests.
 - Configurable live-test project approval through `PICCOLO_GCP_LIVE_PROJECT`, explicit dotenv loading, and manifests that retain their original project for recovery.
 - Scoped live grants on approved existing secrets, conditional account-creation permission checks, and guest verification of dummy secret access.
-- Local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions remediating H01 and H06 of the 2026-10-11 security audit.
+- Private GCP networking defaults, effective firewall inspection, explicit internal-IP connections, and provider-qualified permission guidance.
+- Verified SSH host enrollment through authenticated guest attributes, finite key lifetimes, and optional interactive gcloud passphrase prompts.
+- Per-resource access reconciliation journals, exact dependency pins, and Dependabot configuration.
+- Gated expire-and-reconnect regressions for SSH/SCP under OS Login and instance metadata, with disposable keys, observed expired-key rejection, renewal evidence, and scoped janitor recovery.
 
 ### Fixed
+
+- Remediate 2026-10-11 security audit findings H01-H06 with local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions.
+- Remediate 2026-10-11 security audit findings M01–M08 with guest IAM safeguards, immutable creation and recovery identities, strict relocation settings, and private verified bootstrap uploads and runners.
 
 - Reject inherited and persisted gcloud authentication overrides on all connection paths, including receipt reads and live tunnels.
 - Validate supported SDK credential JSON before type-specific loading, including environment and well-known ADC files.

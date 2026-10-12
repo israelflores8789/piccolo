@@ -3,13 +3,13 @@
 
 repos:
 - repo: https://github.com/crate-ci/typos
-  rev: v1.50.0
+  rev: 4d9c206a77c041268485162b8e2579ad7a5cb9a3 # v1.50.0
   hooks:
   - id: typos
     args: [--force-exclude]
 
 - repo: https://github.com/google/yamlfmt
-  rev: v0.21.0
+  rev: 21ca5323a9c87ee37a434e0ca908efc0a89daa07 # v0.21.0
   hooks:
   - id: yamlfmt
     args:
@@ -17,7 +17,7 @@ repos:
     - indent=2,indentless_arrays=true,retain_line_breaks=true
 
 - repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v6.0.0
+  rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
   hooks:
   - id: trailing-whitespace
   - id: end-of-file-fixer
@@ -26,6 +26,6 @@ repos:
   - id: check-added-large-files
 
 - repo: https://github.com/rhysd/actionlint
-  rev: v1.7.12
+  rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
   hooks:
   - id: actionlint

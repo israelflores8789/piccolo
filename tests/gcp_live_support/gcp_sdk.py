@@ -49,6 +49,7 @@ class LiveCloud(SDKCloud):
         super().__init__(config, clients)
         self.manifest = manifest
         self.provisioner = provisioner or config.gcp.auth.impersonate_service_account
+        self.ssh_login_mode = "oslogin"
 
     @override
     def get(self, kind: str, name: str, zone: str = "") -> Document | None:
@@ -257,8 +258,21 @@ class LiveCloud(SDKCloud):
                 resource = document(resource)
                 metadata = document(resource.get("metadata", {}))
                 items = objects(metadata, "items")
+                if self.ssh_login_mode not in {"oslogin", "metadata"}:
+                    raise PiccoloError("Unsupported live SSH login mode")
                 if not any(text(item, "key") == "enable-oslogin" for item in items):
-                    items.append({"key": "enable-oslogin", "value": "TRUE"})
+                    items.append(
+                        {
+                            "key": "enable-oslogin",
+                            "value": "TRUE"
+                            if self.ssh_login_mode == "oslogin"
+                            else "FALSE",
+                        }
+                    )
+                if self.ssh_login_mode == "metadata" and not any(
+                    text(item, "key") == "block-project-ssh-keys" for item in items
+                ):
+                    items.append({"key": "block-project-ssh-keys", "value": "TRUE"})
                 metadata["items"] = [item for item in items]
                 resource["metadata"] = metadata
             self.prepare(
@@ -395,6 +409,12 @@ class LiveCloud(SDKCloud):
                 ]
             case _:
                 return self.list(kind)
+
+    def remove_ssh_key(self, entry: Document) -> None:
+        """Use the configured connector to clean up its exact disposable test key."""
+        from gcp_live_support.ssh_expiry import remove_test_key
+
+        remove_test_key(self.config, self.manifest, entry)
 
     def delete(self, entry: Document) -> None:
         """Recheck ownership immediately and persist one bounded delete request."""
@@ -621,6 +641,26 @@ class LiveAccess(Access):
         """Use the same provisioner clients and persisted run identity."""
         super().__init__(cloud.config, cloud.clients)
         self.cloud = cloud
+
+    @override
+    def mutation(
+        self,
+        key: str,
+        submit: Callable[[], str],
+        observe: Callable[[], str],
+        *,
+        recover: Callable[[Document], str] | None = None,
+    ) -> None:
+        """Use the fixture manifest's enclosing account intent for test writes."""
+        del recover
+        if observe():
+            return
+        if (
+            key != f"service-account:{self.gcp.service_account}"
+            or not self.cloud.manifest.lookup("account", self.gcp.service_account)
+        ):
+            raise PiccoloError("Live access mutation lacks an enclosing fixture intent")
+        submit()
 
     @override
     def service_account(self) -> None:

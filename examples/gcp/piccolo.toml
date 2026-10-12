@@ -40,7 +40,7 @@ image = "projects/debian-cloud/global/images/debian-13-trixie-v20260727"
 [gcp.network]
 name = "default"
 subnet = "default"
-external_ip = true
+external_ip = false
 # For custom VPCs, explicitly map every candidate region to an existing subnet.
 # subnets = { us-west1 = "research-west", us-east1 = "research-east" }
 
@@ -57,6 +57,8 @@ project_roles = []
 [gcp.ssh]
 user = "researcher"
 via_iap = true
+require_passphrase = false
+expire-after = "24h"
 readiness_timeout = 300
 # account = "you@example.com"
 # impersonate_service_account = "connection@my-gcp-project.iam.gserviceaccount.com"

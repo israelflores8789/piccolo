@@ -7,6 +7,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def privileged_role(role: str) -> bool:
+    """Identify basic, administrative, and credential delegation guest roles."""
+    lowered = role.lower()
+    return (
+        role in {"roles/owner", "roles/editor"}
+        or lowered.endswith("admin")
+        or ".admin" in lowered
+        or "admin." in lowered
+        or role
+        in {
+            "roles/iam.serviceAccountTokenCreator",
+            "roles/iam.serviceAccountOpenIdTokenCreator",
+            "roles/iam.serviceAccountUser",
+            "roles/iam.workloadIdentityUser",
+        }
+    )
+
+
 @dataclass(frozen=True)
 class Auth:
     """Separate SDK credentials from the selected gcloud connection account."""
@@ -60,6 +78,9 @@ class GCP:
     remote_port: int
     local_port: int
     operation_timeout: int
+    internal_ip: bool = False
+    require_passphrase: bool = False
+    expire_after: str = "24h"
 
 
 @dataclass(frozen=True)

@@ -36,7 +36,7 @@ from google.cloud import compute_v1, iam_admin_v1, resourcemanager_v3, service_u
 from google.iam.v1 import iam_policy_pb2, policy_pb2
 
 from piccolo.config import Config
-from piccolo.data import Document, document, text
+from piccolo.data import Document, document, objects, text
 from piccolo.errors import PiccoloError
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.connection import GCloudConnection
@@ -85,6 +85,7 @@ class MemoryBackend:
         self.resources: dict[str, Document] = {}
         self.deleted: list[str] = []
         self.bindings_removed: list[str] = []
+        self.ssh_keys_removed: list[str] = []
         self.pending = False
         self.fail_delete = ""
         self.fail_inventory = ""
@@ -126,6 +127,9 @@ class MemoryBackend:
 
     def remove_binding(self, entry: Document) -> None:
         self.bindings_removed.append(text(entry, "key"))
+
+    def remove_ssh_key(self, entry: Document) -> None:
+        self.ssh_keys_removed.append(text(entry, "key"))
 
     def add(self, kind: str, suffix: str, *, zone: str = "") -> Document:
         name = f"{RUN}-{suffix}"
@@ -1045,3 +1049,70 @@ def test_missing_openssh_fails_locally(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with pytest.raises(PiccoloError, match="ssh"):
         local_preflight()
+
+
+def test_janitor_removes_recorded_ssh_keys_only_when_applied(
+    manifest: Manifest,
+) -> None:
+    backend = MemoryBackend(manifest)
+    manifest.put("ssh_keys", {"key": "disposable-key", "status": "publishing"})
+    assert cleanup(manifest, backend, apply=False) == []
+    assert not backend.ssh_keys_removed
+    assert cleanup(manifest, backend, apply=True) == []
+    assert backend.ssh_keys_removed == ["disposable-key"]
+
+
+def test_janitor_keeps_ssh_keys_while_compute_cleanup_is_unresolved(
+    manifest: Manifest,
+) -> None:
+    backend = MemoryBackend(manifest)
+    backend.add("disk", "boot", zone=ZONE)
+    backend.fail_delete = "disk"
+    manifest.put("ssh_keys", {"key": "disposable-key", "status": "publishing"})
+    assert cleanup(manifest, backend, apply=True)
+    assert not backend.ssh_keys_removed
+    assert manifest.data["complete"] is False
+
+
+def test_janitor_preserves_failed_ssh_key_cleanup_for_recovery(
+    manifest: Manifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = MemoryBackend(manifest)
+    manifest.put("ssh_keys", {"key": "disposable-key", "status": "publishing"})
+    monkeypatch.setattr(
+        backend,
+        "remove_ssh_key",
+        Mock(side_effect=PiccoloError("connector unavailable")),
+    )
+    failures = cleanup(manifest, backend, apply=True)
+    assert failures and "SSH key disposable-key" in failures[0]
+    assert manifest.data["complete"] is False
+    assert manifest.entries("ssh_keys")[0]["status"] == "publishing"
+
+
+@pytest.mark.parametrize("mode", ["oslogin", "metadata"])
+def test_login_mode_is_selected_before_first_vm_access(
+    approved: Config, manifest: Manifest, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from piccolo.providers.gcp.resources import SDKCloud
+
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    cloud.ssh_login_mode = mode
+    monkeypatch.setattr(cloud, "get", Mock(return_value=None))
+    submit = Mock(return_value="created-operation")
+    monkeypatch.setattr(SDKCloud, "submit", submit)
+    resource: Document = {
+        "name": approved.gcp.name,
+        "labels": labels(approved),
+        "metadata": {"items": [{"key": "enable-guest-attributes", "value": "TRUE"}]},
+    }
+    cloud.submit("instance.insert", approved.gcp.name, ZONE, resource, "request")
+    payload = submit.call_args.args[3]
+    metadata = document(payload["metadata"])
+    settings = {
+        text(item, "key"): text(item, "value") for item in objects(metadata, "items")
+    }
+    assert settings["enable-guest-attributes"] == "TRUE"
+    assert settings["enable-oslogin"] == ("TRUE" if mode == "oslogin" else "FALSE")
+    if mode == "metadata":
+        assert settings["block-project-ssh-keys"] == "TRUE"
