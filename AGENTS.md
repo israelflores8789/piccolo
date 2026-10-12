@@ -13,9 +13,46 @@ A Python CLI utility that provisions and helps manage remote infrastructure with
 
 ```
 piccolo/
-├── pyproject.toml            # Hatchling packaging; Python >= 3.12
+├── .github/                   # GitHub configuration
+├── .vscode/                   # Editor configuration
+├── audits/                    # Security audit reports
+├── examples/gcp/              # GCP configuration examples
 ├── src/piccolo/
-│   ├── __init__.py
+│   ├── __main__.py            # Python module entrypoint
+│   ├── cli.py                 # Typer command-line interface
+│   ├── bootstrap/             # Remote bootstrap support
+│   │   ├── execution.py       # Bootstrap execution and receipts
+│   │   └── staging.py         # Remote bootstrap file staging
+│   ├── config/                # TOML configuration parsing
+│   │   ├── discovery.py       # Configuration file discovery
+│   │   ├── loader.py          # Configuration loading and validation
+│   │   └── models.py          # Configuration data models
+│   ├── providers/             # Provider interfaces and registry
+│   │   ├── base.py            # Provider abstractions
+│   │   ├── registry.py        # Provider registration
+│   │   └── gcp/               # Google Cloud provider
+│   │       ├── access.py      # IAM and firewall management
+│   │       ├── auth.py        # GCP credential resolution
+│   │       ├── clients.py     # Google Cloud client collection
+│   │       ├── connection.py  # gcloud and SSH connections
+│   │       ├── operations.py  # Cloud operation interfaces
+│   │       ├── permissions.py # Permission error formatting
+│   │       ├── provider.py    # GCP lifecycle operations
+│   │       ├── provision.py   # Resource construction and validation
+│   │       └── resources.py   # Google Cloud resource API
+│   └── state/                 # Local state and journal
+│       ├── journal.py         # Operation journal persistence
+│       ├── lock.py            # Environment file locking
+│       └── storage.py         # Private state file handling
+├── tests/
+│   ├── conftest.py            # Shared pytest fixtures
+│   └── gcp_live_support/      # Shared live-test helpers
+├── config.schema.json         # Configuration schema
+├── justfile                   # Development task recipes
+├── lean-bootstrap.sh          # Minimal bootstrap script
+├── lean-gcp-infrastructure.sh # Minimal GCP provisioning script
+├── lean-local-start.sh        # Local startup script
+└── pyproject.toml             # Hatchling packaging; Python >= 3.12
 ```
 
 ## Architecture
