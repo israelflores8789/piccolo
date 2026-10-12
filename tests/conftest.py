@@ -7,13 +7,52 @@ import os
 import shlex
 import shutil
 import subprocess
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from gcp_live_support.deadline import Deadline, live_session
 
 from piccolo.config import Config, load
 from piccolo.data import Document, document, objects, text
 from piccolo.errors import PiccoloError, UncertainError
+
+LIVE_DEADLINE = pytest.StashKey[Deadline]()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def live_deadline(request: pytest.FixtureRequest) -> Generator[None]:
+    """Apply one cooperative deadline and transport bounds only for live runs."""
+    if not request.config.getoption("--gcp-live"):
+        yield
+        return
+    with live_session() as deadline:
+        request.config.stash[LIVE_DEADLINE] = deadline
+        yield
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip subsequent live tests before fixtures when the work deadline expires."""
+    if item.get_closest_marker("gcp_live") and item.config.getoption("--gcp-live"):
+        current = item.config.stash.get(LIVE_DEADLINE, None)
+        if current is not None:
+            try:
+                current.remaining()
+            except PiccoloError as exc:
+                pytest.skip(str(exc))
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Return failure when the deadline leaves part of the live matrix unrun."""
+    current = session.config.stash.get(LIVE_DEADLINE, None)
+    if (
+        current is not None
+        and current.work_expired
+        and session.exitstatus == pytest.ExitCode.OK
+    ):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
 
 CONFIG = """schema_version = 1
 environment = "test-env"

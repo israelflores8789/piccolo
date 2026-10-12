@@ -15,6 +15,7 @@ from google.oauth2 import service_account
 from piccolo.config.models import GCP
 from piccolo.data import decode, text
 from piccolo.errors import PiccoloError
+from piccolo.privacy import remember_secrets
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -49,6 +50,7 @@ def file_credentials(path: Path) -> Credentials:
     """
     try:
         info = decode(path.read_text())
+        remember_secrets(info)
     except (OSError, ValueError) as exc:
         raise PiccoloError("Cannot read SDK credential JSON") from exc
     kind = text(info, "type")

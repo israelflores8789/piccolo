@@ -9,6 +9,7 @@ The impersonation case also requires PICCOLO_GCP_LIVE_HUMAN_ADC.
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -21,7 +22,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from gcp_live_support.deadline import bind_client, check_work, timeout
 from gcp_live_support.gcp_live import (
+    approval_digest,
     local_preflight,
     preflight,
     profile,
@@ -32,6 +35,7 @@ from gcp_live_support.manifest import Manifest, cleanup, gate
 
 from piccolo.data import Document, document, objects, text
 from piccolo.errors import CapacityError, PiccoloError, UncertainError
+from piccolo.logger import emit, log
 
 pytestmark = pytest.mark.gcp_live
 
@@ -68,7 +72,17 @@ def gcp_run(
     manifest = Manifest.create(
         directory / "manifest.json", config.path, run, project=config.gcp.project_id
     )
-    print(f"Durable cleanup manifest: {manifest.path}", flush=True)
+    manifest.data["approval_sha256"] = approval_digest(base)
+    manifest.data["run_settings_fingerprint"] = config.fingerprint
+    manifest.data["test"] = request.node.nodeid
+    manifest.data["guest_account_variant"] = "created" if request.param else "existing"
+    manifest.data["deadline_seconds"] = 2700
+    manifest.data["cleanup_command"] = (
+        f"just janitor-gcp-live {shlex.quote(str(manifest.path))} 1"
+    )
+    manifest.save()
+    log(f"Durable cleanup manifest: {manifest.path}")
+    log(f"Independent cleanup: {text(manifest.data, 'cleanup_command')}")
     monkeypatch.setenv("PICCOLO_STATE_DIR", str(directory / "state"))
     GCloudConnection(config.gcp).check_identity()
     with environment_lock(config):
@@ -95,6 +109,14 @@ def gcp_run(
             yield provider
         finally:
             failures = cleanup(manifest, cloud, apply=True)
+            emit(
+                {
+                    "manifest": str(manifest.path),
+                    "residual_cost_exposure": manifest.data.get(
+                        "residual_cost_exposure"
+                    ),
+                }
+            )
             if failures:
                 pytest.fail(
                     "Teardown incomplete; resources may incur costs. "
@@ -137,9 +159,11 @@ def test_human_source_provisioner_impersonation(tmp_path: Path) -> None:
         impersonated = credentials(config)
         assert isinstance(impersonated, impersonated_credentials.Credentials)
         assert provisioner_identity(impersonated, base) == target
-        project = resourcemanager_v3.ProjectsClient(
-            credentials=impersonated
-        ).get_project(name=f"projects/{base.gcp.project_id}", timeout=30)
+        client = resourcemanager_v3.ProjectsClient(credentials=impersonated)
+        bind_client(client)
+        project = client.get_project(
+            name=f"projects/{base.gcp.project_id}", timeout=timeout()
+        )
         assert project.project_id == base.gcp.project_id
         print("Human-source provisioner impersonation verified; no IAM writes")
     finally:
@@ -152,6 +176,13 @@ def verify_guest_secrets(provider: "GCPProvider", zone: str) -> None:
     for secret in provider.gcp.secrets:
         if secret.startswith(f"{provider.config.environment}-"):
             continue
+        from gcp_live_support.gcp_sdk import LiveCloud
+
+        assert isinstance(provider.cloud, LiveCloud)
+        entry = provider.cloud.manifest.lookup("secret", secret)
+        assert entry is not None
+        version = text(entry, "dummy_version")
+        assert version
         command = (
             "python3 - <<'PY'\n"
             "import json, urllib.request, hashlib\n"
@@ -161,7 +192,7 @@ def verify_guest_secrets(provider: "GCPProvider", zone: str) -> None:
             "headers={'Metadata-Flavor': 'Google'})\n"
             "token = json.load(urllib.request.urlopen(r))['access_token']\n"
             f"url = 'https://secretmanager.googleapis.com/v1/projects/"
-            f"{provider.gcp.project_id}/secrets/{secret}/versions/latest:access'\n"
+            f"{version.removeprefix('projects/')}:access'\n"
             "r = urllib.request.Request(url, "
             "headers={'Authorization': 'Bearer ' + token})\n"
             "payload = json.load(urllib.request.urlopen(r))['payload']['data']\n"
@@ -317,6 +348,7 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
             "2>&1 < /dev/null & echo $! > ~/piccolo-live-http/pid",
         )
         gate(provider.gcp.project_id)
+        check_work()
         process = subprocess.Popen(
             [
                 *connection.launcher(),
@@ -336,9 +368,10 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
         )
         deadline = time.monotonic() + 90
         while True:
+            check_work()
             try:
                 with urllib.request.urlopen(
-                    f"http://127.0.0.1:{provider.gcp.local_port}/", timeout=5
+                    f"http://127.0.0.1:{provider.gcp.local_port}/", timeout=timeout(5)
                 ) as response:
                     assert response.read() == (
                         f"piccolo tunnel {provider.config.environment}".encode()

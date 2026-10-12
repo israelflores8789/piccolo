@@ -23,11 +23,15 @@ All notable changes to this project will be documented in this file. The format 
 - Verified SSH host enrollment through authenticated guest attributes, finite key lifetimes, and optional interactive gcloud passphrase prompts.
 - Per-resource access reconciliation journals, exact dependency pins, and Dependabot configuration.
 - Gated expire-and-reconnect regressions for SSH/SCP under OS Login and instance metadata, with disposable keys, observed expired-key rejection, renewal evidence, and scoped janitor recovery.
+- Shared privacy and console logging modules, owned private state storage, and bootstrap process-group observation and receipt recovery instructions.
+- A cooperative 45-minute live-test deadline with reserved cleanup/inventory time, reviewed profile digests, verified dummy-secret versions, and residual-resource reports without a dollar limit.
 
 ### Fixed
 
 - Remediate 2026-10-11 security audit findings H01-H06 with local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions.
 - Remediate 2026-10-11 security audit findings M01–M08 with guest IAM safeguards, immutable creation and recovery identities, strict relocation settings, and private verified bootstrap uploads and runners.
+- Remediate 2026-10-11 security audit findings M09–M12 and L01–L02 with bootstrap interruption guards, credential redaction, explicit recovery-copy finalization, canonical settings fingerprints, corrected live instructions, and runtime-only wheel contents.
+- Inspect the pinned Compute SDK's `firewall_policys` response field so inherited non-IAP ingress remains blocked.
 
 - Reject inherited and persisted gcloud authentication overrides on all connection paths, including receipt reads and live tunnels.
 - Validate supported SDK credential JSON before type-specific loading, including environment and well-known ADC files.

@@ -28,14 +28,23 @@ def receipt(journal: Journal, connection: Connection, zone: str) -> Document:
         (
             f"if test -f {path}/exit-code; then cat "
             f"{path}/exit-code; elif test -d {path}; then "
-            f"printf started; else printf unknown; fi"
+            f"printf 'started:'; if test -f {path}/process-id; then "
+            f"cat {path}/process-id; fi; else printf unknown; fi"
         ),
     )
     if output.isdecimal():
         record["exit_code"] = int(output)
         record["status"] = "completed" if output == "0" else "failed"
     else:
-        record["status"] = "started" if output == "started" else "uncertain"
+        record["status"] = (
+            "started"
+            if output.startswith("started:") or output == "started"
+            else "uncertain"
+        )
+        _, _, process_id = output.partition(":")
+        if process_id.isdecimal():
+            record["process_id"] = int(process_id)
+            record["process_group_id"] = int(process_id)
     journal.data["bootstrap"] = record
     journal.save()
     return record
@@ -93,6 +102,7 @@ def execute(
     connection.ready(zone)
     if verify is not None:
         verify()
+    connection.execute(zone, "command -v setsid >/dev/null")
     script = home_path(text(record, "remote_path"))
     connection.execute(zone, private_path(text(record, "remote_path")))
     digest = connection.execute(zone, f"sha256sum {script}").split()[0]
@@ -107,6 +117,8 @@ def execute(
 
 umask 077
 attempt={attempt}
+printf '%s\\n' "$$" > "$attempt/process-id.tmp"
+mv "$attempt/process-id.tmp" "$attempt/process-id"
 {private_path(text(record, "remote_path"))}
 exec 3< {script}
 expected={text(record, "digest")}
@@ -126,6 +138,8 @@ exit "$rc"
     record["status"] = "started"
     record["authorized_at"] = time.time()
     record["log_path"] = f"{attempt_path}/output.log"
+    record["process_path"] = f"{attempt_path}/process-id"
+    record["timeout_policy"] = "observation deadline; the detached process continues"
     journal.data["bootstrap"] = record
     journal.save()
     try:
@@ -136,7 +150,7 @@ exit "$rc"
                 f"test \"$(sha256sum /proc/self/fd/4 | cut -d ' ' -f1)\" = "
                 f"{runner_digest}; "
                 f"umask 077; test ! -L {attempt}; "
-                f"mkdir -m 700 {attempt} && (nohup bash "
+                f"mkdir -m 700 {attempt} && (nohup setsid bash "
                 f"/proc/self/fd/4 >{attempt}/output.log "
                 f"2>&1 </dev/null &)"
             ),
@@ -164,6 +178,7 @@ exit "$rc"
         time.sleep(min(2, max(0, deadline - time.monotonic())))
     raise UncertainError(
         "Bootstrap is still running or uncertain; "
-        "inspect --status and guest logs. It will "
+        "Observation deadline expired; the detached process is not cancelled. "
+        "Inspect --status and guest logs. It will "
         "never be retried automatically"
     )

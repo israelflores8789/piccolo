@@ -4,6 +4,7 @@
 """gcp_sdk.py — Manifest-backed test adapter; never used by ordinary CLI commands."""
 
 import json
+import re
 import time
 from collections.abc import Callable
 from typing import override
@@ -12,6 +13,7 @@ from google.api_core import exceptions
 from google.cloud import compute_v1, iam_admin_v1, secretmanager_v1
 from google.iam.v1 import iam_policy_pb2, options_pb2, policy_pb2
 
+from gcp_live_support.deadline import bind_clients, check_work, timeout
 from gcp_live_support.manifest import Manifest, gate
 from piccolo.config.models import Config
 from piccolo.data import Document, decode, document, objects, text
@@ -47,6 +49,7 @@ class LiveCloud(SDKCloud):
                 "Live runs require matching project/run, pre-enabled APIs, no roles"
             )
         super().__init__(config, clients)
+        bind_clients(clients)
         self.manifest = manifest
         self.provisioner = provisioner or config.gcp.auth.impersonate_service_account
         self.ssh_login_mode = "oslogin"
@@ -203,6 +206,40 @@ class LiveCloud(SDKCloud):
             if not self.owns(previous, observed):
                 raise PiccoloError("Existing target identity changed")
             return
+        dummy_version = ""
+        if kind == "secret":
+            if document(observed.get("labels", {})).get("piccolo-live-dummy") != "true":
+                raise PiccoloError(
+                    "Approved existing secret must be labelled "
+                    "piccolo-live-dummy=true before any IAM grant"
+                )
+            canonical_name = text(observed, "name")
+            if (
+                re.fullmatch(
+                    rf"projects/(?:{re.escape(self.project)}|[1-9][0-9]*)/secrets/{re.escape(name)}",
+                    canonical_name,
+                )
+                is None
+            ):
+                raise PiccoloError(
+                    "Existing secret has an unexpected canonical resource name"
+                )
+            response = self.clients.secrets.access_secret_version(
+                name=f"projects/{self.project}/secrets/{name}/versions/latest",
+                retry=None,
+                timeout=timeout(),
+            )
+            dummy_version = response.name
+            prefix = f"{canonical_name}/versions/"
+            if (
+                not dummy_version.startswith(prefix)
+                or not dummy_version.removeprefix(prefix).isdecimal()
+                or response.payload.data != b"TEST_thisisadummytestsecret_TEST"
+            ):
+                raise PiccoloError(
+                    "Existing live secret is not the approved dummy payload/version; "
+                    "guest grants are blocked"
+                )
         from gcp_live_support.manifest import resource_key
 
         self.manifest.put(
@@ -215,6 +252,7 @@ class LiveCloud(SDKCloud):
                 "id": text(observed, "id"),
                 "absent_before": False,
                 "preserve": True,
+                "dummy_version": dummy_version,
             },
         )
 
@@ -232,6 +270,7 @@ class LiveCloud(SDKCloud):
     def perform[T](self, action: Document, operation: Callable[[], T]) -> T:
         """Keep transport failures uncertain but record definitive rejected writes."""
         gate(self.project)
+        check_work()
         try:
             return operation()
         except (
@@ -252,6 +291,7 @@ class LiveCloud(SDKCloud):
     ) -> str:
         """Gate and journal every Compute mutation, including lifecycle operations."""
         gate(self.project)
+        check_work()
         resource_kind, verb = kind.split(".")
         if verb == "insert":
             if resource_kind == "instance":
@@ -351,6 +391,7 @@ class LiveCloud(SDKCloud):
             resource_kind, verb = kind.split(".")
             deadline = time.monotonic() + self.config.gcp.operation_timeout
             while True:
+                check_work()
                 observed = self.get(resource_kind, name)
                 if verb == "delete" and observed is None:
                     break
@@ -372,6 +413,7 @@ class LiveCloud(SDKCloud):
             self.manifest.put("actions", action)
             deadline = time.monotonic() + self.config.gcp.operation_timeout
             while True:
+                check_work()
                 result = self.poll(operation, zone)
                 if text(result, "status") == "DONE":
                     action["error"] = str(failure(result) or "")

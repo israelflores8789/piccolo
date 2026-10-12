@@ -877,7 +877,7 @@ class Access:
 
         for rule in objects(policy, "firewalls"):
             check(rule, hierarchical=False)
-        for inherited in objects(policy, "firewall_policies"):
+        for inherited in objects(policy, "firewall_policys"):
             for rule in objects(inherited, "rules"):
                 check(rule, hierarchical=True)
         return {

@@ -1,0 +1,179 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+"""deadline.py — Cooperative live-session deadline with reserved cleanup time."""
+
+from __future__ import annotations
+
+import subprocess
+import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Literal, cast
+from unittest.mock import patch
+from weakref import WeakSet
+
+from piccolo.errors import PiccoloError
+
+if TYPE_CHECKING:
+    from piccolo.providers.gcp.clients import Clients
+    from piccolo.providers.gcp.connection import GCloudConnection
+
+TOTAL_SECONDS = 45 * 60
+CLEANUP_SECONDS = 5 * 60
+INVENTORY_SECONDS = 60
+type Phase = Literal["work", "cleanup", "inventory"]
+ACTIVE: ContextVar[Deadline | None] = ContextVar("piccolo_live_deadline", default=None)
+_BOUND_CLIENTS: WeakSet[object] = WeakSet()
+
+
+class Deadline:
+    """Share a monotonic deadline across all tests, RPCs, and teardown phases."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        """Reserve the final five minutes, including one minute for inventory."""
+        self.clock = clock
+        self.started = clock()
+        self.phase: Phase = "work"
+        self.work_expired = False
+
+    def remaining(self) -> float:
+        """Return the remaining time for this phase, raising before new calls."""
+        reserve = {
+            "work": CLEANUP_SECONDS,
+            "cleanup": INVENTORY_SECONDS,
+            "inventory": 0,
+        }
+        remaining = self.started + TOTAL_SECONDS - reserve[self.phase] - self.clock()
+        if remaining <= 0:
+            if self.phase == "work":
+                self.work_expired = True
+            raise PiccoloError(
+                f"Live-test {self.phase} deadline expired; "
+                "retain manifest and report residual resources"
+            )
+        return remaining
+
+    @contextmanager
+    def during(self, phase: Phase) -> Generator[None]:
+        """Change phase temporarily without granting a fresh time allowance."""
+        previous = self.phase
+        self.phase = phase
+        try:
+            yield
+        finally:
+            self.phase = previous
+
+
+def check_work() -> None:
+    """Prevent work or cloud mutations after the active phase expires."""
+    current = ACTIVE.get()
+    if current is not None:
+        current.remaining()
+
+
+def timeout(seconds: float = 30) -> float:
+    """Bound one in-flight request by the current remaining phase allowance."""
+    current = ACTIVE.get()
+    return min(seconds, current.remaining()) if current is not None else seconds
+
+
+@contextmanager
+def phase(name: Phase) -> Generator[None]:
+    """Enter cleanup or inventory while preserving a single session deadline."""
+    current = ACTIVE.get()
+    if current is None:
+        yield
+    else:
+        with current.during(name):
+            yield
+
+
+def bounded_rpc(method: object) -> Callable[..., object]:
+    """Wrap a generated SDK transport call, including pager's subsequent calls."""
+    call = cast(Callable[..., object], method)
+
+    def invoke(*args: object, **kwargs: object) -> object:
+        """Disable retries and recompute remaining time before every RPC."""
+        supplied = kwargs.get("timeout")
+        seconds = float(supplied) if isinstance(supplied, int | float) else 30.0
+        kwargs["timeout"] = timeout(min(30.0, seconds))
+        kwargs["retry"] = None
+        return call(*args, **kwargs)
+
+    return invoke
+
+
+def bind_client(client: object) -> None:
+    """Install phase-aware deadlines in the pinned SDK's generated transport map."""
+    if ACTIVE.get() is None or client in _BOUND_CLIENTS:
+        return
+    transport: object = getattr(client, "_transport", None)
+    methods: object = getattr(transport, "_wrapped_methods", None)
+    if not isinstance(methods, dict):
+        raise PiccoloError("SDK client cannot enforce live RPC deadlines")
+    mapping = cast(dict[object, object], methods)
+    for key, method in mapping.items():
+        if not callable(method):
+            raise PiccoloError("Unexpected SDK transport method")
+        mapping[key] = bounded_rpc(method)
+    _BOUND_CLIENTS.add(client)
+
+
+def bind_clients(clients: Clients) -> None:
+    """Bound all services used by the live adapter and its access reconciler."""
+    for name in (
+        "instances",
+        "compute_projects",
+        "disks",
+        "snapshots",
+        "firewalls",
+        "networks",
+        "subnets",
+        "zone_operations",
+        "global_operations",
+        "projects",
+        "folders",
+        "organizations",
+        "secrets",
+        "iam",
+        "services",
+    ):
+        bind_client(getattr(clients, name))
+
+
+@contextmanager
+def live_session() -> Generator[Deadline]:
+    """Bound gcloud as well as SDK calls in pytest or the independent janitor."""
+    existing = ACTIVE.get()
+    if existing is not None:
+        yield existing
+        return
+    from piccolo.providers.gcp.connection import GCloudConnection
+
+    deadline = Deadline()
+    token = ACTIVE.set(deadline)
+    original_run = GCloudConnection.run
+
+    def bounded_run(
+        self: GCloudConnection,
+        arguments: list[str],
+        *,
+        timeout: int | None = 60,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Recompute remaining phase time before any gcloud operation."""
+        current = ACTIVE.get()
+        seconds = min(30.0, float(timeout) if timeout is not None else 30.0)
+        if current is not None:
+            seconds = min(seconds, current.remaining())
+        if seconds < 1:
+            raise PiccoloError("Live transport deadline expired")
+        return original_run(self, arguments, timeout=int(seconds), capture=capture)
+
+    try:
+        with patch.object(GCloudConnection, "run", bounded_run):
+            yield deadline
+    finally:
+        ACTIVE.reset(token)

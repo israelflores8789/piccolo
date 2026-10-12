@@ -1,7 +1,7 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 
-"""lock.py — Kernel-released environment locks for Linux, macOS, and Windows."""
+"""lock.py — Kernel-released locks using validated private state storage."""
 
 import hashlib
 import os
@@ -12,13 +12,15 @@ from pathlib import Path
 from piccolo.config.models import Config
 from piccolo.errors import PiccoloError
 from piccolo.state.journal import state_directory
+from piccolo.state.storage import private_directory, private_file
 
 
 @contextmanager
 def environment_lock(config: Config) -> Generator[None]:
     """Serialize environment and same-name VM mutations within one state root."""
     directory = state_directory(config)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_directory(directory.parent)
+    private_directory(directory)
     identity = f"{config.provider}:{config.gcp.project_id}:{config.gcp.name}"
     key = hashlib.sha256(identity.encode()).hexdigest()[:24]
     with (
@@ -31,7 +33,8 @@ def environment_lock(config: Config) -> Generator[None]:
 @contextmanager
 def file_lock(path: Path) -> Generator[None]:
     """Hold one nonblocking kernel lock and release it on every exit path."""
-    with path.open("a+b") as stream:
+    private_directory(path.parent)
+    with os.fdopen(private_file(path, create=True), "r+b") as stream:
         stream.seek(0, os.SEEK_END)
         if stream.tell() == 0:
             stream.write(b"\0")

@@ -125,8 +125,8 @@ def test_move_stops_before_snapshot_and_preserves_contents(
     assert replacement["metadata"] == {
         "items": [{"key": "research", "value": "keep-me"}]
     }
-    assert not cloud.list("snapshot")
-    assert len(cloud.list("disk")) == 1
+    assert len(cloud.list("snapshot")) == 1
+    assert len(cloud.list("disk")) == 2
     kinds = [item[0] for item in cloud.calls]
     assert (
         kinds.index("instance.stop")
@@ -152,7 +152,7 @@ def test_readiness_failure_keeps_source_and_snapshot_then_resumes(
     connection.readiness_failure = False
     GCPProvider(config, cloud, connection).resume()
     assert len(cloud.list("instance")) == 1
-    assert not cloud.list("snapshot")
+    assert len(cloud.list("snapshot")) == 1
 
 
 def test_failed_move_can_rollback_only_when_requests_settled(
@@ -238,7 +238,11 @@ def test_changed_config_blocks_resume(
     provider = GCPProvider(config, cloud, connection)
     with pytest.raises(UncertainError):
         provider.init()
-    config.path.write_text(config.path.read_text() + "\n# changed\n")
+    config.path.write_text(
+        config.path.read_text().replace(
+            'machine_type = "n2-standard-4"', 'machine_type = "n2-standard-8"'
+        )
+    )
     from piccolo.config import load
 
     with pytest.raises(PiccoloError, match="Configuration changed"):
@@ -278,7 +282,7 @@ def test_failed_source_cleanup_can_resume_after_permission_repair(
     recovered.resume()
     assert not recovered.journal.operation
     assert len(cloud.list("instance")) == 1
-    assert not cloud.list("snapshot")
+    assert len(cloud.list("snapshot")) == 1
 
 
 def test_extra_disks_rejected_before_source_mutation(

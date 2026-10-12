@@ -12,9 +12,12 @@ import uuid
 from pathlib import Path
 from typing import Protocol
 
+from gcp_live_support.deadline import check_work, phase
 from piccolo.data import Document, objects, text
 from piccolo.errors import PiccoloError
+from piccolo.privacy import sanitize_text
 from piccolo.state.journal import Journal
+from piccolo.state.storage import private_directory, private_file
 
 PROJECT_ID_PATTERN = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
 RESOURCE_KINDS = ("instance", "disk", "snapshot", "firewall", "secret", "account")
@@ -66,7 +69,7 @@ class Manifest(Journal):
             raise PiccoloError("Refusing to overwrite an existing run manifest")
         gate(project)
         result = cls.__new__(cls)
-        result.path = path.resolve()
+        result.path = path.absolute()
         result.directory = result.path.parent
         result.data = {
             "schema_version": 1,
@@ -88,9 +91,12 @@ class Manifest(Journal):
         from piccolo.data import decode
 
         result = cls.__new__(cls)
-        result.path = path.resolve()
+        result.path = path.absolute()
         result.directory = result.path.parent
-        result.data = decode(result.path.read_text())
+        private_directory(result.directory.parent, create=False)
+        private_directory(result.directory, create=False)
+        with os.fdopen(private_file(result.path)) as stream:
+            result.data = decode(stream.read())
         result.validate()
         return result
 
@@ -154,6 +160,7 @@ class Manifest(Journal):
 
     def intent(self, kind: str, name: str, zone: str, request: str = "") -> Document:
         """Persist a unique request before submission, including janitor deletes."""
+        check_work()
         request = request or str(uuid.uuid4())
         previous = next(
             (a for a in self.entries("actions") if text(a, "key") == request), None
@@ -204,7 +211,7 @@ class CleanupBackend(Protocol):
         ...
 
 
-def cleanup(
+def cleanup_actions(
     manifest: Manifest, backend: CleanupBackend, *, apply: bool = False
 ) -> list[str]:
     """Reconcile first, delete in dependency order, and retain every failure."""
@@ -217,6 +224,7 @@ def cleanup(
         if action.get("settled") is True:
             continue
         try:
+            check_work()
             if not backend.settle(action):
                 failures.append(f"Unresolved request {text(action, 'key')}")
         except Exception as exc:
@@ -234,6 +242,7 @@ def cleanup(
         if kind == "secret":
             for binding in manifest.entries("bindings"):
                 try:
+                    check_work()
                     backend.remove_binding(binding)
                 except Exception as exc:
                     failures.append(f"IAM {text(binding, 'key')}: {exc}")
@@ -244,6 +253,7 @@ def cleanup(
                 continue
             label = text(entry, "url", text(entry, "key"))
             try:
+                check_work()
                 observed = backend.get(kind, text(entry, "name"), text(entry, "zone"))
                 if observed is None:
                     continue
@@ -270,6 +280,7 @@ def cleanup(
                             raise PiccoloError(
                                 "Attached disk identity changed; preserve VM"
                             )
+                check_work()
                 backend.delete(entry)
                 if backend.get(kind, text(entry, "name"), text(entry, "zone")):
                     raise PiccoloError("Deletion not verified")
@@ -278,24 +289,100 @@ def cleanup(
     if not failures:
         for entry in manifest.entries("ssh_keys"):
             try:
+                check_work()
                 backend.remove_ssh_key(entry)
             except Exception as exc:
                 failures.append(f"SSH key {text(entry, 'key')}: {exc}")
-    # Prefix discovery reports strays but never authorizes deletion by name alone.
+    return failures
+
+
+def residual_report(
+    manifest: Manifest, backend: CleanupBackend, failures: list[str]
+) -> list[str]:
+    """Inventory even after cleanup failures, distinguishing leftovers/unknowns."""
     run = text(manifest.data, "run")
-    for kind in RESOURCE_KINDS:
-        try:
-            for observed in backend.inventory(kind):
+    leftovers: list[Document] = []
+    unknown: list[str] = []
+    with phase("inventory"):
+        for kind in RESOURCE_KINDS:
+            try:
+                check_work()
+                observed_resources = backend.inventory(kind)
+            except Exception as exc:
+                message = f"Incomplete {kind} inventory: {exc}"
+                failures.append(message)
+                unknown.append(kind)
+                continue
+            for observed in observed_resources:
                 name = text(observed, "name").rsplit("/", 1)[-1]
                 if kind == "account":
-                    name = text(observed, "email").split("@")[0]
+                    name = text(observed, "email", name)
                 if name.startswith(f"{run}-"):
                     zone = text(observed, "zone").rsplit("/", 1)[-1]
                     url = resource_url(text(manifest.data, "project"), kind, name, zone)
                     failures.append(f"Leftover {kind}: {url}")
-        except Exception as exc:
-            failures.append(f"Incomplete {kind} inventory: {exc}")
+                    leftovers.append(
+                        {
+                            "kind": kind,
+                            "name": name,
+                            "zone": zone,
+                            "id": text(
+                                observed,
+                                "id",
+                                text(
+                                    observed, "uniqueId", text(observed, "createTime")
+                                ),
+                            ),
+                            "status": text(observed, "status"),
+                            "url": url,
+                        }
+                    )
+    failures = [sanitize_text(message) for message in failures]
+    manifest.data["residual_cost_exposure"] = {
+        "dollar_limit_enforced": False,
+        "remaining_resources": [entry for entry in leftovers],
+        "unverified_inventory": [kind for kind in unknown],
+        "unverified_resources": [
+            {
+                "kind": text(entry, "kind"),
+                "name": text(entry, "name"),
+                "zone": text(entry, "zone"),
+                "last_recorded_id": text(entry, "id"),
+                "url": text(entry, "url"),
+                "verification": "final inventory unavailable",
+            }
+            for entry in manifest.entries("resources")
+            if text(entry, "kind") in unknown
+        ],
+        "unverified_cleanup": [
+            message for message in failures if not message.startswith("Leftover ")
+        ],
+        "operator_responsibility": (
+            "Resources may continue billing; no maximum bill is guaranteed"
+        ),
+    }
     manifest.data["cleanup_failures"] = [message for message in failures]
     manifest.data["complete"] = not failures
     manifest.save()
     return failures
+
+
+def cleanup(
+    manifest: Manifest, backend: CleanupBackend, *, apply: bool = False
+) -> list[str]:
+    """Reserve cleanup time and always report final exposure after apply attempts."""
+    manifest.validate()
+    if apply:
+        gate(text(manifest.data, "project"))
+    failures: list[str] = []
+    try:
+        with phase("cleanup"):
+            failures = cleanup_actions(manifest, backend, apply=apply)
+    except BaseException as exc:
+        failures.append(
+            f"Cleanup interrupted or could not be verified: {type(exc).__name__}"
+        )
+        if apply:
+            residual_report(manifest, backend, failures)
+        raise
+    return residual_report(manifest, backend, failures) if apply else failures

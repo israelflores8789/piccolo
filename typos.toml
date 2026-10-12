@@ -3,3 +3,7 @@
 
 [default.extend-words]
 certifi = "certifi"
+
+[default.extend-identifiers]
+# Google Compute's documented effective-firewall response field.
+firewall_policys = "firewall_policys"

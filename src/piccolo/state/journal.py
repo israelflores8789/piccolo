@@ -12,6 +12,8 @@ from pathlib import Path
 from piccolo.config.models import Config
 from piccolo.data import Document, Value, decode, document, text
 from piccolo.errors import PiccoloError
+from piccolo.privacy import sanitize
+from piccolo.state.storage import private_directory, private_file
 
 
 def state_directory(config: Config) -> Path:
@@ -30,18 +32,20 @@ class Journal:
         self.config = config
         self.directory = state_directory(config)
         self.path = self.directory / "state.json"
+        private_directory(self.directory.parent, create=False)
+        private_directory(self.directory, create=False)
         self.data: Document
         try:
-            self.data = (
-                decode(self.path.read_text())
-                if self.path.exists()
-                else {
+            if self.path.exists() or self.path.is_symlink():
+                with os.fdopen(private_file(self.path)) as stream:
+                    self.data = decode(stream.read())
+            else:
+                self.data = {
                     "schema_version": 1,
                     "project": config.gcp.project_id,
                     "environment": config.environment,
                     "history": [],
                 }
-            )
         except (OSError, ValueError) as exc:
             raise PiccoloError(f"Cannot read journal {self.path}: {exc}") from exc
         if (
@@ -62,16 +66,19 @@ class Journal:
         if operation and text(operation, "fingerprint") != self.config.fingerprint:
             raise PiccoloError(
                 "Configuration changed during an operation; "
-                "restore the original TOML before resume"
+                "restore the original settings before resume"
             )
 
     def save(self) -> None:
         """Replace state atomically after flushing the temporary file."""
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        private_directory(self.directory.parent)
+        private_directory(self.directory)
+        if self.path.exists() or self.path.is_symlink():
+            os.close(private_file(self.path))
         descriptor, temporary = tempfile.mkstemp(dir=self.directory, prefix="state-")
         try:
             with os.fdopen(descriptor, "w") as stream:
-                json.dump(self.data, stream, indent=2, sort_keys=True)
+                json.dump(sanitize(self.data), stream, indent=2, sort_keys=True)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())

@@ -54,6 +54,57 @@ Run all project tasks via `just` from the repository root. Use `just --list` to 
 - Do NOT wrap lines when generating markdown text.
 - USE Keep a Changelog standards in `CHANGELOG.md`; preserve release heading and bullet formatting because `just release` and the GitHub release workflow extract release notes from it.
 
+### Security Audits
+
+The following are to be followed strictly WHEN performing a security audit:
+
+- MAKE an assessment of all dependency versions for known vulnerabilities.
+- INCLUDE an assessment of risks associated with runtime function, especially those without established or ambiguous policy.
+- Do NOT resurface concerns from previously remediated findings or concerns that have established policy.
+
+#### Writing the Audit Document
+
+- PUT findings in the `audits/` directory in an audit document with the following file scheme using the date the audit was performed, not remediated: `YYYY-MM-DD-security.md`.
+- WRITE a small abstract at the very start of the audit document that includes the audit date, reviewed commit hash, and the model identifier that performed the audit (e.g. "gpt-6.1-sol") with a subsequent brief 2-3 sentence description of the audit with a bullet point list of critical findings.
+- KEEP a simple table at the start of the audit document called "Remediation Status" that enumerates each finding by its ID, Concern, and Status.
+- RANK findings by severity using "H##", "M##", and "L##" for high, medium, and low priority findings, respectively, where "##" is the identifying number of the finding.
+- FOR each finding's section, WRITE a heading in the form "$## - ...concern title...", where "$" is the severity rank and "##" is the identifying number, and WRITE the body with the following paragraphs:
+  - "**Evidence:**" -- that clearly points to the file(s) and code line(s) of the finding;
+  - a paragraph that describes the finding;
+  - "**Impact and Conditions:**";
+  - "**Reproduction:**;
+  - "**Recommendation:**".
+- LIST all checks and verifications performed at the end of the audit document.
+
+#### Remediation
+
+WHEN the user asks to remediate a finding, adhere to the following rules:
+
+- UPDATE the status table with the state of the respective finding.
+- UPDATE the respective finding section of the audit document by:
+  - MODIFYING the heading with a status suffix (e.g. "— RESOLVED")
+  - ADDING a subsection to the finding with a subheading with the date of remediation called "Remediation — YYYY-MM-DD" and has the following paragraphs:
+    - a paragraph describing the remediation that was implemented;
+    - "**Regression Coverage:**" -- (if applicable) describing the regression tests implemented.
+
+### Live Testing
+
+When the USER explicitly requests live testing against GCP (or any other live provider), you WILL follow the following rules:
+
+- You will **NEVER** perform live testing unless the USER explicitly asks for live tests to be performed AND gives the following information:
+  - a target provider (required),
+  - the target project ID (required),
+  - an explicit spending budget that you will NEVER exceed (required),
+  - an explicit cumulative test duration maximum (optional; default to the implemented test suite deadline of 45 minutes).
+  - IF the user does not offer this information, you WILL STOP and ASK the USER before performing the live tests; you are PROHIBITED from continuing until the USER gives the required information.
+- UNLESS otherwise given by the USER, you will ALWAYS use a service account called `piccolo-test-provisioner` for Piccolo and Piccolo test actions.
+- UNLESS otherwise given by the USER, you will ALWAYS use a service account called `piccolo-test-vm` for "existing VM" tests.
+- You **MUST** REQUIRE the USER's explicit permission to use the human account for provisioner impersonation tests. You will **NEVER** run impersonation tests or otherwise interact with the human account for ANY purpose UNLESS you have EXPLICIT permission from the USER, and your actions with the human account will be CONSTRAINED to the defined scope of the test OR the USER's explicit request. IF you do NOT have EXPLICIT permission for a required action, **STOP** and ASK the USER for direction.
+
+- You will ALWAYS implement live tests such that they are specific to a given provider and explicitly selectable.
+- You will KEEP or UPDATE a just recipe specific to the live test for a given provider (e.g. `just test-gcp-live`) including related recipes (e.g. `just janitor-gcp-live`).
+- ALL tests, including purely helper source code, belong in the `tests/` directory.
+
 ### Prohibitions
 
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:

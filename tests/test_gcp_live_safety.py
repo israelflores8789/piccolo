@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 from gcp_live_support.gcp_live import (
+    approval_digest,
     local_preflight,
     preflight,
     profile,
@@ -35,7 +36,7 @@ from google.auth.credentials import AnonymousCredentials
 from google.cloud import compute_v1, iam_admin_v1, resourcemanager_v3, service_usage_v1
 from google.iam.v1 import iam_policy_pb2, policy_pb2
 
-from piccolo.config import Config
+from piccolo.config import Config, load
 from piccolo.data import Document, document, objects, text
 from piccolo.errors import PiccoloError
 from piccolo.providers.gcp.clients import Clients
@@ -317,8 +318,26 @@ def test_existing_secret_target_is_preserved_and_requires_exact_identity(
         approved, gcp=replace(approved.gcp, secrets=("approved-secret",))
     )
     cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
-    observed: Document = {"id": "original", "name": "approved-secret"}
+    observed: Document = {
+        "id": "original",
+        "name": f"projects/{TEST_PROJECT}/secrets/approved-secret",
+        "labels": {"piccolo-live-dummy": "true"},
+    }
     monkeypatch.setattr(cloud, "get", Mock(return_value=observed))
+    from google.cloud import secretmanager_v1
+
+    monkeypatch.setattr(
+        cloud.clients.secrets,
+        "access_secret_version",
+        Mock(
+            return_value=secretmanager_v1.AccessSecretVersionResponse(
+                name=f"projects/{TEST_PROJECT}/secrets/approved-secret/versions/1",
+                payload=secretmanager_v1.SecretPayload(
+                    data=b"TEST_thisisadummytestsecret_TEST"
+                ),
+            )
+        ),
+    )
     cloud.preserve_external("secret", "approved-secret")
     entry = manifest.lookup("secret", "approved-secret")
     assert entry is not None and cloud.owns(entry, observed)
@@ -1017,7 +1036,9 @@ def test_created_account_waits_for_act_as_without_recreating(
     )
 
 
-def test_direct_profile_and_identity(approved: Config, tmp_path: Path) -> None:
+def test_direct_profile_and_identity(
+    approved: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     approved = replace(
         approved,
         gcp=replace(
@@ -1029,6 +1050,9 @@ def test_direct_profile_and_identity(approved: Config, tmp_path: Path) -> None:
     content = generated.path.read_text()
     generated.path.write_text(
         content[: content.index("[bootstrap]")] + content[content.index("[gcp]") :]
+    )
+    monkeypatch.setenv(
+        "PICCOLO_GCP_LIVE_APPROVAL_SHA256", approval_digest(load(generated.path))
     )
     assert not profile(generated.path).gcp.auth.impersonate_service_account
     provisioner = f"provisioner@{TEST_PROJECT}.iam.gserviceaccount.com"

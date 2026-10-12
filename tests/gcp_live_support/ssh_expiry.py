@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
+from gcp_live_support.deadline import timeout
 from gcp_live_support.manifest import Manifest, gate
 from piccolo.config import Config
 from piccolo.data import Document, decode, document, objects, text
@@ -251,7 +252,7 @@ class SSHExpiryProbe:
             shell=False,
             text=True,
             capture_output=True,
-            timeout=30,
+            timeout=timeout(),
             check=False,
         )
         if result.returncode:
@@ -355,7 +356,7 @@ class SSHExpiryProbe:
             shell=False,
             text=True,
             capture_output=True,
-            timeout=30,
+            timeout=timeout(),
             env=self.connection.environment(),
             check=False,
         )

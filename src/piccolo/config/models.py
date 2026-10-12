@@ -3,8 +3,12 @@
 
 """models.py — Immutable provider-neutral and GCP configuration models."""
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
+
+from piccolo.data import Document, Value, value
 
 
 def privileged_role(role: str) -> bool:
@@ -93,3 +97,32 @@ class Config:
     gcp: GCP
     bootstrap: Bootstrap | None
     fingerprint: str
+
+
+def canonical_value(raw: object) -> Value:
+    """Convert parsed settings to JSON, preserving significant array order."""
+    if isinstance(raw, Path):
+        return str(raw)
+    if is_dataclass(raw) and not isinstance(raw, type):
+        return {
+            field.name: canonical_value(getattr(raw, field.name))
+            for field in fields(raw)
+        }
+    if isinstance(raw, tuple):
+        return [canonical_value(item) for item in raw]
+    return value(raw)
+
+
+def settings_fingerprint(config: Config) -> str:
+    """Hash effective parsed settings independently of source formatting/path."""
+    settings: Document = {
+        "schema_version": 1,
+        "environment": config.environment,
+        "provider": config.provider,
+        "gcp": canonical_value(config.gcp),
+        "bootstrap": canonical_value(config.bootstrap),
+    }
+    canonical = json.dumps(
+        settings, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()

@@ -22,6 +22,7 @@ from pathlib import Path
 from piccolo.config.models import GCP
 from piccolo.data import Document, decode, document, objects, text
 from piccolo.errors import PiccoloError
+from piccolo.logger import log
 
 AUTH_OVERRIDES = (
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
@@ -290,7 +291,7 @@ class GCloudConnection:
                 raise PiccoloError(f"gcloud account {selected} is not logged in")
         self.selected_account = selected
         self.identity_checked = True
-        print(
+        log(
             f"Connection account: {selected}; "
             f"impersonation: "
             f"{self.config.connection_impersonate or 'none'} "
@@ -437,7 +438,7 @@ class GCloudConnection:
                 ) and "No trusted GCP host keys" not in str(exc):
                     raise
                 diagnostic = str(exc)
-            print(f"Waiting for SSH in {zone}...")
+            log(f"Waiting for SSH in {zone}...")
             time.sleep(min(2, max(0, deadline - time.monotonic())))
         raise PiccoloError(f"SSH readiness timed out: {diagnostic}")
 

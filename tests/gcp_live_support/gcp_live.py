@@ -7,6 +7,7 @@ Set PICCOLO_GCP_LIVE_PROJECT to match the live profile and recovery manifest.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -15,11 +16,31 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gcp_live_support.deadline import check_work, live_session
 from gcp_live_support.manifest import Manifest, cleanup, gate
 from piccolo.config import Config, load
 from piccolo.data import Document, text
 from piccolo.errors import PiccoloError
+from piccolo.logger import emit, log
 from piccolo.state.lock import environment_lock
+from piccolo.state.storage import private_directory
+
+
+def approval_digest(config: Config) -> str:
+    """Bind approval to effective profile, variant selection, and deadline policy."""
+    policy = {
+        "settings": config.fingerprint,
+        "move_cases": os.environ.get("PICCOLO_GCP_LIVE_MOVE_CASES", "all"),
+        "duration_seconds": 2700,
+        "cleanup_seconds": 300,
+        "inventory_seconds": 60,
+        "dummy_payload_sha256": hashlib.sha256(
+            b"TEST_thisisadummytestsecret_TEST"
+        ).hexdigest(),
+    }
+    return hashlib.sha256(
+        json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def profile(path: Path) -> Config:
@@ -64,6 +85,11 @@ def profile(path: Path) -> Config:
         )
     ):
         raise PiccoloError("Complete the live profile placeholders before running")
+    if os.environ.get("PICCOLO_GCP_LIVE_APPROVAL_SHA256") != approval_digest(config):
+        raise PiccoloError(
+            "Pin PICCOLO_GCP_LIVE_APPROVAL_SHA256 to the reviewed "
+            "profile digest before live execution"
+        )
     return config
 
 
@@ -84,6 +110,8 @@ def run_config(
     """Write a sanitized durable config and an exclusively harmless bootstrap."""
     g = base.gcp
     gate(g.project_id)
+    check_work()
+    private_directory(directory.parent)
     directory.mkdir(parents=True, exist_ok=False, mode=0o700)
     script = directory / "marker.sh"
     script.write_text(
@@ -154,6 +182,8 @@ readiness_timeout = {g.readiness_timeout}
 remote_port = 8080
 local_port = {g.local_port}
 """)
+    script.chmod(0o600)
+    path.chmod(0o600)
     return load(path)
 
 
@@ -269,7 +299,14 @@ def preflight(
     cloud.manifest.data["baseline_apis"] = [api for api in baseline]
     inventory: Document = {}
     for kind in ("instance", "disk", "snapshot", "firewall", "secret", "account"):
-        inventory[kind] = [item for item in cloud.inventory(kind)]
+        inventory[kind] = [
+            {
+                key: item[key]
+                for key in ("name", "id", "zone", "status", "email")
+                if key in item
+            }
+            for item in cloud.inventory(kind)
+        ]
     cloud.manifest.data["baseline_inventory"] = inventory
     cloud.manifest.save()
 
@@ -284,13 +321,19 @@ def main() -> None:
     gate(text(manifest.data, "project"))
     config = load(Path(text(manifest.data, "config")))
     gate(config.gcp.project_id)
+    recorded_fingerprint = text(manifest.data, "run_settings_fingerprint")
+    if recorded_fingerprint and recorded_fingerprint != config.fingerprint:
+        raise PiccoloError(
+            "Recovery settings changed; restore the recorded settings "
+            "before janitor execution"
+        )
     # Import optional SDKs only after validating local gates and manifest identity.
     from gcp_live_support.gcp_sdk import LiveCloud
     from piccolo.providers.gcp.auth import credentials
     from piccolo.providers.gcp.clients import Clients
 
     os.environ["PICCOLO_STATE_DIR"] = str(manifest.directory / "state")
-    with environment_lock(config):
+    with environment_lock(config), live_session():
         sdk_credentials = credentials(config.gcp)
         cloud = LiveCloud(
             config,
@@ -299,11 +342,20 @@ def main() -> None:
             provisioner=provisioner_identity(sdk_credentials, config),
         )
         if not args.apply:
-            print(json.dumps(manifest.entries("resources"), indent=2))
+            emit({"resources": [entry for entry in manifest.entries("resources")]})
         failures = cleanup(manifest, cloud, apply=args.apply)
+        if args.apply:
+            emit(
+                {
+                    "manifest": str(manifest.path),
+                    "residual_cost_exposure": manifest.data.get(
+                        "residual_cost_exposure"
+                    ),
+                }
+            )
         if failures:
             raise SystemExit("\n".join(failures))
-        print("Zero leftovers verified" if args.apply else "Preview only; no deletions")
+        log("Zero leftovers verified" if args.apply else "Preview only; no deletions")
 
 
 # Type-only imports keep profile checks and ordinary collection cloud-free.

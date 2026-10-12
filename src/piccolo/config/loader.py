@@ -5,14 +5,21 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import re
 import tomllib
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 from piccolo.config.discovery import discover
-from piccolo.config.models import GCP, Auth, Bootstrap, Config, privileged_role
+from piccolo.config.models import (
+    GCP,
+    Auth,
+    Bootstrap,
+    Config,
+    privileged_role,
+    settings_fingerprint,
+)
 from piccolo.data import Document, Value, document
 from piccolo.errors import PiccoloError
 
@@ -282,7 +289,7 @@ def load(path: Path | None = None) -> Config:
         root,
     ):
         section.finish()
-    return Config(
+    config = Config(
         selected,
         environment,
         provider,
@@ -322,5 +329,6 @@ def load(path: Path | None = None) -> Config:
             expire_after,
         ),
         bootstrap,
-        hashlib.sha256(source).hexdigest(),
+        "",
     )
+    return replace(config, fingerprint=settings_fingerprint(config))

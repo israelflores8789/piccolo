@@ -10,6 +10,8 @@ from piccolo.bootstrap import execution, staging
 from piccolo.config.models import Config
 from piccolo.data import Document, Value, document, objects, text
 from piccolo.errors import CapacityError, PiccoloError
+from piccolo.logger import log, reporter
+from piccolo.privacy import resource_record, sanitize
 from piccolo.providers.base import Connection
 from piccolo.providers.gcp.auth import credentials
 from piccolo.providers.gcp.clients import Clients
@@ -52,7 +54,7 @@ class GCPProvider:
         config: Config,
         cloud: Cloud | None = None,
         connection: Connection | None = None,
-        notify: Callable[[str], None] = print,
+        notify: Callable[[str], None] = log,
     ) -> None:
         """Accept injected adapters so lifecycle tests never contact GCP."""
         self.config = config
@@ -72,9 +74,9 @@ class GCPProvider:
         self.journal = Journal(config)
         if isinstance(self.cloud, SDKCloud):
             self.cloud.journal = self.journal
-        self.notify = notify
+        self.notify = reporter(notify)
         self.operations = Operations(
-            self.cloud, self.journal, self.gcp.operation_timeout, notify
+            self.cloud, self.journal, self.gcp.operation_timeout, self.notify
         )
 
     def connection_target(self, zone: str) -> Document:
@@ -158,8 +160,10 @@ class GCPProvider:
             "config": str(self.config.path),
             "project": self.gcp.project_id,
             "environment": self.config.environment,
-            "instances": [document(item) for item in self.instances()],
-            "operation": self.journal.operation,
+            "instances": [
+                document(sanitize(item, diagnostic=True)) for item in self.instances()
+            ],
+            "operation": sanitize(self.journal.operation, diagnostic=True),
             "bootstrap": document(
                 self.journal.data.get("bootstrap", {"status": "unknown"})
             ),
@@ -191,7 +195,7 @@ class GCPProvider:
             "differences": drift,
             "access": self.cloud.access_plan(),
             "bootstrap": "stage on fresh provisioning only; never execute",
-            "operation": self.journal.operation,
+            "operation": sanitize(self.journal.operation, diagnostic=True),
         }
 
     def safe_start(self, instance: Document) -> None:
@@ -553,6 +557,7 @@ class GCPProvider:
     def stop(self) -> None:
         """Stop an existing VM without touching its disk or setup."""
         instance = self.active()
+        self.guard_bootstrap()
         self.safe_start(instance)
         if text(instance, "status") == "TERMINATED":
             return
@@ -574,6 +579,8 @@ class GCPProvider:
         """Verify instance identity and await a start or stop operation."""
         operation = self.journal.operation
         kind, zone = text(operation, "kind"), text(operation, "zone")
+        if kind == "stop":
+            self.guard_bootstrap()
         instance = self.cloud.get("instance", self.gcp.name, zone)
         if instance is None or text(instance, "id") != text(operation, "instance_id"):
             raise PiccoloError("Power-operation target identity changed")
@@ -588,12 +595,7 @@ class GCPProvider:
     def move(self, destination: str | None) -> None:
         """Inspect and journal the source before protecting or stopping."""
         source = self.active()
-        setup = document(self.journal.data.get("bootstrap", {}))
-        if text(setup, "status") in {"started", "uncertain"}:
-            raise PiccoloError(
-                "Bootstrap may still be running; inspect bootstrap --status "
-                "before moving the VM"
-            )
+        self.guard_bootstrap()
         if text(source, "status") not in {"RUNNING", "TERMINATED"}:
             raise PiccoloError("Source must be RUNNING or TERMINATED")
         disk = self.disk(source)
@@ -619,8 +621,8 @@ class GCPProvider:
                 "kind": "move",
                 "id": operation_id,
                 "stage": "inspect",
-                "source": source,
-                "source_disk": disk,
+                "source": resource_record(source),
+                "source_disk": resource_record(disk),
                 "zones": [zone for zone in zones],
                 "snapshot": f"{self.gcp.name[:40]}-move-{operation_id[:12]}",
             }
@@ -640,12 +642,13 @@ class GCPProvider:
         return source
 
     def continue_move(self) -> None:
-        """Protect, stop, snapshot, replace, verify SSH, commit, and clean up."""
+        """Protect, stop, snapshot, replace, verify SSH, and retain recovery data."""
         operation = self.journal.operation
         self.journal.check_fingerprint()
         if operation.get("committed") is True:
             self.commit_cleanup()
             return
+        self.guard_bootstrap()
         recorded = document(operation["source"])
         zone = zone_of(recorded)
         source = self.source()
@@ -689,7 +692,8 @@ class GCPProvider:
                 "labels": labels(self.config, text(operation, "id")),
             },
         )
-        replacement = self.choose(recorded)
+        # Opaque metadata/descriptions are reread rather than saved in state.
+        replacement = self.choose(stopped)
         operation = self.journal.operation
         operation["replacement_zone"] = zone_of(replacement)
         operation["replacement_id"] = text(replacement, "id")
@@ -719,7 +723,7 @@ class GCPProvider:
         self.commit_cleanup()
 
     def commit_cleanup(self) -> None:
-        """Delete only verified retired resources after a durable replacement commit."""
+        """Retire the source VM, retaining disk/snapshot until explicit cleanup."""
         operation = self.journal.operation
         replacement = self.cloud.get(
             "instance", self.gcp.name, text(operation, "replacement_zone")
@@ -734,11 +738,35 @@ class GCPProvider:
                 "recovery resources retained"
             )
         self.check_owner(replacement)
+        recorded_snapshot = next(
+            (
+                item
+                for item in objects(operation, "artifacts")
+                if item.get("kind") == "snapshot"
+                and item.get("name") == text(operation, "snapshot")
+            ),
+            None,
+        )
+        snapshot = self.cloud.get("snapshot", text(operation, "snapshot"))
+        if (
+            snapshot is None
+            or recorded_snapshot is None
+            or text(snapshot, "id") != text(recorded_snapshot, "id")
+        ):
+            raise PiccoloError("Recovery snapshot identity changed; source retained")
+        if not owned(self.config, snapshot, text(operation, "id")):
+            raise PiccoloError("Recovery snapshot ownership changed; source retained")
         source = self.source()
         source_record = document(operation["source"])
         zone = zone_of(source_record)
         if source:
             self.safe_start(source)
+            if text(self.disk(source), "id") != text(
+                document(operation["source_disk"]), "id"
+            ):
+                raise PiccoloError(
+                    "Retired source boot disk identity changed; retained"
+                )
             if (
                 text(source, "status") != "TERMINATED"
                 or boot_disk(source).get("auto_delete") is not False
@@ -747,41 +775,22 @@ class GCPProvider:
                     "Retired source is not stopped with a protected boot disk"
                 )
             self.operations.run("delete-source", "instance.delete", self.gcp.name, zone)
-        disk_record = document(operation["source_disk"])
-        disk_name = text(disk_record, "name")
-        disk = self.cloud.get("disk", disk_name, zone)
-        if disk and owned(self.config, disk):
-            if text(disk, "id") != text(disk_record, "id") or disk.get("users"):
-                raise PiccoloError("Retired boot disk changed or is attached; retained")
-            self.operations.run("delete-source-disk", "disk.delete", disk_name, zone)
-        elif disk:
-            self.notify(
-                "Retained original boot disk because it was not created by Piccolo"
-            )
-        snapshot = self.cloud.get("snapshot", text(operation, "snapshot"))
-        if snapshot:
-            recorded_snapshot = next(
-                (
-                    item
-                    for item in objects(operation, "artifacts")
-                    if item.get("kind") == "snapshot"
-                    and item.get("name") == text(snapshot, "name")
-                ),
-                None,
-            )
-            if recorded_snapshot is None or text(snapshot, "id") != text(
-                recorded_snapshot, "id"
-            ):
-                raise PiccoloError("Recovery snapshot identity changed; retained")
-            if not owned(self.config, snapshot, text(operation, "id")):
-                raise PiccoloError("Recovery snapshot ownership changed; retained")
-            self.operations.run(
-                "delete-snapshot", "snapshot.delete", text(operation, "snapshot")
-            )
+        operation["recovery_retained"] = True
         self.journal.finish()
         self.notify(
-            "Move complete; disk contents preserved and bootstrap was not executed"
+            "Move complete; source disk and recovery snapshot retained and billable. "
+            "Validate workload/data integrity, inspect cleanup, then explicitly "
+            "run cleanup --apply to discard eligible recovery copies"
         )
+
+    def guard_bootstrap(self) -> None:
+        """Block guest interruption until its one authorized attempt is resolved."""
+        setup = document(self.journal.data.get("bootstrap", {}))
+        if text(setup, "status") in {"started", "uncertain"}:
+            raise PiccoloError(
+                "Bootstrap may still be running; inspect bootstrap --status "
+                "and resolve its receipt before stopping or moving the VM"
+            )
 
     def resume(self) -> None:
         """Recover using recorded requests, resource identities, and original config."""

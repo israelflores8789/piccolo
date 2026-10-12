@@ -3,7 +3,6 @@
 
 """cli.py — Declarative environment commands and predictable config selection."""
 
-import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,8 +12,9 @@ import typer
 from yaspin import yaspin
 
 from piccolo.config import load
-from piccolo.data import Document, text
+from piccolo.data import text
 from piccolo.errors import PiccoloError
+from piccolo.logger import emit, log
 from piccolo.providers.registry import create
 from piccolo.state.lock import environment_lock
 
@@ -52,11 +52,6 @@ def selected(ctx: typer.Context, config: Path | None) -> Path | None:
     return config if config is not None else global_config
 
 
-def emit(result: Document) -> None:
-    """Render inspectable JSON with stable formatting."""
-    typer.echo(json.dumps(result, indent=2, sort_keys=True))
-
-
 def invoke(
     ctx: typer.Context,
     path: Path | None,
@@ -72,13 +67,13 @@ def invoke(
     """Dispatch commands through provider contracts with local mutation locks."""
     try:
         config = load(selected(ctx, path))
-        typer.echo(
+        log(
             f"Config: {config.path}\nProject: "
             f"{config.gcp.project_id}\nEnvironment: "
             f"{config.environment}"
         )
         if action == "validate":
-            typer.echo("Configuration valid")
+            log("Configuration valid")
             return
         match action:
             case "status":
@@ -130,7 +125,7 @@ def invoke(
                                 raise PiccoloError("Choose --dry-run or --status")
                             emit(provider.bootstrap(dry_run, status))
     except (PiccoloError, OSError, ValueError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
+        log(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
 

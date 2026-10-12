@@ -22,11 +22,15 @@ test *args:
     {{pytest}} -v -s {{args}}
 
 # Set PICCOLO_GCP_LIVE_PROJECT directly or load it with --dotenv-path.
+approval-gcp-live config:
+    uv run --locked python tests/gcp_approval.py "{{ config }}"
+
 test-gcp-live config test-name="tests/test_gcp_live.py":
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
-    mkdir -p .test_logs .test_runs
+    : "${PICCOLO_GCP_LIVE_APPROVAL_SHA256:?Pin the reviewed digest from just approval-gcp-live}"
+    uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(".test_logs/pytest-gcp-live.log"), create=True))'
     PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="{{ config }}" \
         {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "{{ test-name }}" < /dev/null \
         2>&1 | tee .test_logs/pytest-gcp-live.log

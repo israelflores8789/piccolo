@@ -130,7 +130,7 @@ def test_effective_firewalls_reject_non_iap_ingress(
     payload: Document = {"firewalls": [broad]}
     if hierarchical:
         payload = {
-            "firewall_policies": [
+            "firewall_policys": [
                 {
                     "rules": [
                         {
