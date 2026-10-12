@@ -1,0 +1,65 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local:
+    name: Local checks
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    - name: Install development dependencies
+      run: uv sync --locked --all-groups
+
+    - name: Run local tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        verbose: true
+        emoji: true
+        job-summary: true
+        report-title: "Piccolo local tests"
+        custom-pytest: uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
+        custom-arguments: '-s -m "not gcp_live" --junitxml=junit.xml'
+
+    - name: Save JUnit test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-test-results
+        path: junit.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+    - name: Check formatting and lint
+      run: |
+        uv run --locked ruff check src tests
+        uv run --locked ruff format --check src tests
+
+    - name: Check types
+      run: uv run --locked pyrefly check src tests/gcp_live_support
