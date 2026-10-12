@@ -25,8 +25,17 @@ All notable changes to this project will be documented in this file. The format 
 - Gated expire-and-reconnect regressions for SSH/SCP under OS Login and instance metadata, with disposable keys, observed expired-key rejection, renewal evidence, and scoped janitor recovery.
 - Shared privacy and console logging modules, owned private state storage, and bootstrap process-group observation and receipt recovery instructions.
 - A cooperative 45-minute live-test deadline with reserved cleanup/inventory time, reviewed profile digests, verified dummy-secret versions, and residual-resource reports without a dollar limit.
+- Selectable live security/recovery and SSH/SCP expiration sequences that share fixtures to reduce repeated VM setup within a cumulative testing allowance.
 
 ### Fixed
+
+- Accept output-only Compute VM and disk resource status during relocation without copying it into replacement requests.
+- Omit source integrity-baseline update actions from replacement creation while preserving Shielded VM settings.
+- Preserve approved guest project roles in live tests and remove only test-added IAM members during teardown.
+- Verify live fixture SSH metadata on creation and recovery, support shorter run deadlines and ordered case selection with preserved argument boundaries, and pace Service Usage attempts alongside bounded transient-read retries.
+- Preserve public secret resource and IAM binding identifiers during credential redaction so independent cleanup can reopen live manifests.
+- Wait for authenticated guest host-key publication before starting SSH expiration observations.
+- Permanently purge manifest-proven test snapshots from the GCP recycle bin, include recoverable copies in residual inventories, and retain uncertain purge requests without resubmission.
 
 - Remediate 2026-10-11 security audit findings H01-H06 with local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions.
 - Remediate 2026-10-11 security audit findings M01–M08 with guest IAM safeguards, immutable creation and recovery identities, strict relocation settings, and private verified bootstrap uploads and runners.

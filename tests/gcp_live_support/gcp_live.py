@@ -62,13 +62,12 @@ def profile(path: Path) -> Config:
         or gcp.service_account == gcp.auth.impersonate_service_account
         or gcp.create_service_account
         or gcp.enable_apis
-        or gcp.project_roles
         or config.bootstrap is not None
     ):
         raise PiccoloError(
             "Live profile requires a separate provisioner identity and human "
             "connection account, existing VM account, pre-enabled APIs, "
-            "and no bootstrap or project roles"
+            "and no bootstrap"
         )
     if len(gcp.zones) < 2 or len({z.rsplit("-", 1)[0] for z in gcp.zones}) < 2:
         raise PiccoloError("Approve at least two zones in different regions")
@@ -172,7 +171,7 @@ source_ranges = ["35.235.240.0/20"]
 [gcp.iam]
 create_service_account = {str(create_account).lower()}
 secrets = {quote((run + "-dummy", *g.secrets))}
-project_roles = []
+project_roles = {quote(g.project_roles)}
 [gcp.ssh]
 user = {quote(g.ssh_user)}
 account = {quote(g.connection_account)}
@@ -219,6 +218,9 @@ def preflight(
         "compute.snapshots.create",
         "compute.snapshots.delete",
         "compute.snapshots.get",
+        "compute.recoverableSnapshots.get",
+        "compute.recoverableSnapshots.list",
+        "compute.recoverableSnapshots.delete",
         "compute.snapshots.list",
         "compute.snapshots.useReadOnly",
         "compute.firewalls.create",
@@ -248,6 +250,13 @@ def preflight(
                 "iam.serviceAccounts.create",
                 "iam.serviceAccounts.delete",
                 "iam.serviceAccounts.setIamPolicy",
+            ]
+        )
+    if config.gcp.project_roles:
+        permissions.extend(
+            [
+                "resourcemanager.projects.getIamPolicy",
+                "resourcemanager.projects.setIamPolicy",
             ]
         )
     if config.gcp.external_ip:

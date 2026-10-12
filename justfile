@@ -25,14 +25,18 @@ test *args:
 approval-gcp-live config:
     uv run --locked python tests/gcp_approval.py "{{ config }}"
 
-test-gcp-live config test-name="tests/test_gcp_live.py":
+[positional-arguments]
+test-gcp-live config test-name="tests/test_gcp_live.py" *args:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
     : "${PICCOLO_GCP_LIVE_APPROVAL_SHA256:?Pin the reviewed digest from just approval-gcp-live}"
+    config="$1"
+    test_name="$2"
+    shift 2
     uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(".test_logs/pytest-gcp-live.log"), create=True))'
-    PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="{{ config }}" \
-        {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "{{ test-name }}" < /dev/null \
+    PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="$config" \
+        {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "$test_name" "$@" < /dev/null \
         2>&1 | tee .test_logs/pytest-gcp-live.log
 
 # Recovery is preview-only unless apply=1; uses the retained run manifest.
@@ -48,6 +52,10 @@ janitor-gcp-live manifest apply="0":
     esac
     PICCOLO_GCP_LIVE=1 \
         uv run --locked python tests/gcp_janitor.py --manifest "{{ manifest }}" "${args[@]}"
+
+# Recover manifest-proven snapshots retained from the approved Piccolo session.
+purge-snapshots-gcp-live:
+    PICCOLO_GCP_LIVE=1 PYTHONPATH=tests uv run --locked python -m gcp_live_support.session purge-snapshots
 
 coverage *args:
     uv run --locked pytest --cov=src/piccolo --cov-report=term-missing {{args}}

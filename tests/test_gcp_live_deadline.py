@@ -17,12 +17,14 @@ from gcp_live_support.deadline import (
     Deadline,
     bind_client,
     bounded_rpc,
+    fixture_time_available,
     live_session,
     phase,
 )
 from gcp_live_support.gcp_live import approval_digest, profile, run_config
 from gcp_live_support.gcp_sdk import LiveCloud
 from gcp_live_support.manifest import Manifest, cleanup, resource_key
+from google.api_core import exceptions
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import compute_v1, secretmanager_v1
 from test_gcp_live_safety import RUN, TEST_PROJECT, MemoryBackend
@@ -64,6 +66,139 @@ def test_rpc_deadline_blocks_new_work_and_reserves_cleanup(
     now[0] = TOTAL_SECONDS
     with phase("inventory"), pytest.raises(PiccoloError, match="inventory deadline"):
         rpc()
+
+
+def test_transient_service_read_retry_rechecks_deadline(
+    active_deadline: tuple[Deadline, list[float]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retry only selected idempotent reads without resetting the phase budget."""
+    _, now = active_deadline
+    method = Mock(side_effect=[exceptions.ServiceUnavailable("temporary"), "available"])
+    monkeypatch.setattr(
+        "gcp_live_support.deadline.time.sleep",
+        lambda delay: now.__setitem__(0, now[0] + delay),
+    )
+    rpc = bounded_rpc(method, retry_service_read=True)
+    now[0] = TOTAL_SECONDS - CLEANUP_SECONDS - 5
+    assert rpc() == "available"
+    assert method.call_args.kwargs == {"timeout": 4.5, "retry": None}
+    method.reset_mock(side_effect=True)
+    method.side_effect = exceptions.ServiceUnavailable("temporary")
+    now[0] = TOTAL_SECONDS - CLEANUP_SECONDS - 0.25
+    with pytest.raises(PiccoloError, match="work deadline"):
+        rpc()
+    assert method.call_count == 1
+
+
+def test_service_usage_pacing_is_shared_and_covers_retry_attempts(
+    active_deadline: tuple[Deadline, list[float]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Space independent clients and retry attempts by at least 1.05 seconds."""
+    _, now = active_deadline
+    starts: list[float] = []
+    sleeps: list[float] = []
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    def read(**kwargs: object) -> str:
+        del kwargs
+        starts.append(now[0])
+        if len(starts) == 3:
+            raise exceptions.ServiceUnavailable("temporary")
+        return "enabled"
+
+    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", sleep)
+    first = bounded_rpc(read, pace_service_usage=True, retry_service_read=True)
+    second = bounded_rpc(read, pace_service_usage=True, retry_service_read=True)
+    assert first() == "enabled"
+    assert second() == "enabled"
+    assert first() == "enabled"
+    assert starts == pytest.approx([0, 1.05, 2.10, 3.15])
+    assert sum(sleeps) == pytest.approx(3.15)
+
+
+def test_service_usage_pacing_refuses_a_call_without_time_for_its_delay(
+    active_deadline: tuple[Deadline, list[float]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leave the cleanup reserve intact instead of sleeping past the work limit."""
+    deadline, now = active_deadline
+    method = Mock(return_value="enabled")
+    sleeper = Mock()
+    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", sleeper)
+    now[0] = TOTAL_SECONDS - CLEANUP_SECONDS - 0.5
+    rpc = bounded_rpc(method, pace_service_usage=True)
+    assert rpc() == "enabled"
+    with pytest.raises(PiccoloError, match="pacing"):
+        rpc()
+    assert method.call_count == 1
+    assert deadline.work_expired
+    sleeper.assert_not_called()
+
+
+def test_short_remaining_work_skips_new_fixtures_and_marks_matrix_incomplete(
+    active_deadline: tuple[Deadline, list[float]],
+) -> None:
+    """Stop before new provisioning while keeping time for current cleanup."""
+    deadline, now = active_deadline
+    now[0] = TOTAL_SECONDS - CLEANUP_SECONDS - 120
+    assert fixture_time_available()
+    now[0] += 1
+    assert not fixture_time_available()
+    assert deadline.work_expired
+    with phase("cleanup"):
+        assert deadline.remaining() == 359
+
+
+@pytest.mark.parametrize("error", [exceptions.ServiceUnavailable, exceptions.Forbidden])
+def test_mutations_never_retry_after_service_or_permission_failure(
+    error: type[exceptions.GoogleAPICallError],
+) -> None:
+    """Leave mutating transports uncertain or rejected after their single attempt."""
+    method = Mock(side_effect=error("failure"))
+    with pytest.raises(error):
+        bounded_rpc(method)()
+    assert method.call_count == 1
+
+
+def test_only_service_usage_get_transport_retries_503(
+    active_deadline: tuple[Deadline, list[float]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the pinned REST transport map without retrying its enable mutation."""
+    from google.cloud import service_usage_v1
+
+    del active_deadline
+    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", lambda _: None)
+    client = service_usage_v1.ServiceUsageClient(
+        credentials=AnonymousCredentials(), transport="rest"
+    )
+    read = Mock(
+        side_effect=[
+            exceptions.ServiceUnavailable("temporary"),
+            service_usage_v1.Service(state=service_usage_v1.State.ENABLED),
+        ]
+    )
+    write = Mock(side_effect=exceptions.ServiceUnavailable("uncertain write"))
+    client._transport._wrapped_methods[client._transport.get_service] = read
+    client._transport._wrapped_methods[client._transport.enable_service] = write
+    bind_client(client)
+    assert (
+        client.get_service(
+            request=service_usage_v1.GetServiceRequest(
+                name="projects/123/services/compute.googleapis.com"
+            )
+        ).state
+        == service_usage_v1.State.ENABLED
+    )
+    assert read.call_count == 2
+    with pytest.raises(exceptions.ServiceUnavailable):
+        client.enable_service(
+            request=service_usage_v1.EnableServiceRequest(
+                name="projects/123/services/compute.googleapis.com"
+            )
+        )
+    assert write.call_count == 1
 
 
 def test_expired_session_skips_before_fixture_setup_and_fails_the_run(
@@ -133,6 +268,30 @@ def test_live_and_janitor_sessions_bound_transport_and_restore_context(
     assert ACTIVE.get() is None
 
 
+def test_shorter_live_session_preserves_cleanup_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Narrow a subsequent run without resetting its cleanup allowance."""
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", "400")
+    with live_session() as deadline:
+        deadline.clock = lambda: deadline.started
+        assert deadline.remaining() == pytest.approx(100)
+        with phase("cleanup"):
+            assert deadline.remaining() == pytest.approx(340)
+        with phase("inventory"):
+            assert deadline.remaining() == pytest.approx(400)
+
+
+@pytest.mark.parametrize("duration", ["0", "300", "2701", "-1", "invalid"])
+def test_live_session_rejects_invalid_or_extended_duration(
+    monkeypatch: pytest.MonkeyPatch, duration: str
+) -> None:
+    """Reject invalid durations and attempts to extend the approved maximum."""
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", duration)
+    with pytest.raises(PiccoloError), live_session():
+        pytest.fail("Invalid deadline was accepted")
+
+
 def make_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: Config
 ) -> Manifest:
@@ -188,7 +347,8 @@ def test_expired_cleanup_reports_unknowns_without_cloud_calls(
     assert cleanup(manifest, backend, apply=True)
     inventory.assert_not_called()
     report = document(manifest.data["residual_cost_exposure"])
-    assert len(report["unverified_inventory"]) == 6
+    assert len(report["unverified_inventory"]) == 7
+    assert "recoverable_snapshot" in report["unverified_inventory"]
     assert not manifest.data["complete"]
 
 

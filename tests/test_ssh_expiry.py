@@ -171,6 +171,7 @@ def test_expiration_oracle_and_reconnect_order(
     probe = ssh_expiry.SSHExpiryProbe(provider, mode, transport)
     clock = Clock()
     monkeypatch.setattr(ssh_expiry, "time", clock)
+    monkeypatch.setattr("piccolo.providers.gcp.connection.time", clock)
     profile: Document = {}
     expiry = [0.0]
     commands: list[list[str]] = []
@@ -180,6 +181,8 @@ def test_expiration_oracle_and_reconnect_order(
         _self: GCloudConnection, args: list[str], **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         commands.append(args)
+        if args[:2] == ["auth", "list"]:
+            return subprocess.CompletedProcess(args, 0, "owner@example.com\n", "")
         if args[:3] == ["compute", "os-login", "describe-profile"]:
             return subprocess.CompletedProcess(args, 0, json.dumps(profile), "")
         assert manifest.entries("ssh_keys")[0]["status"] == "publishing"
@@ -227,18 +230,23 @@ def test_expiration_oracle_and_reconnect_order(
         return subprocess.CompletedProcess([], 0, output, "")
 
     monkeypatch.setattr(probe, "native", native)
-    monkeypatch.setattr(
-        probe.connection,
-        "host_options",
-        lambda _zone, _flag: [
+    host_reads = [0]
+
+    def host_options(_zone: str, _flag: str) -> list[str]:
+        host_reads[0] += 1
+        if host_reads[0] == 1:
+            raise PiccoloError("No trusted GCP host keys are published")
+        return [
             f"--ssh-key-expire-after={probe.connection.config.expire_after}",
             f"--ssh-key-file={private_key}",
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(probe.connection, "host_options", host_options)
     initial = probe.establish()
+    assert host_reads[0] == 3
     original = Path(text(probe.entry, "public_key_path")).read_bytes()
     probe.wait_until_rejected(initial[1])
-    assert len([args for args in commands if args[:2] == ["compute", "ssh"]]) == 1
+    assert len([args for args in commands if args[:2] == ["compute", "ssh"]]) == 2
     assert probe.entry["status"] == "expired-and-rejected"
     probe.reconnect(initial)
     assert manifest.entries("ssh_keys")[0]["status"] == "reconnected"
@@ -248,7 +256,7 @@ def test_expiration_oracle_and_reconnect_order(
         for args in commands
         if args[:2] in (["compute", "ssh"], ["compute", "scp"])
     ]
-    assert transports == ["ssh", transport]
+    assert transports == ["ssh", "ssh", transport]
 
 
 @pytest.mark.parametrize(

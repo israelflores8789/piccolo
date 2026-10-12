@@ -317,8 +317,14 @@ class GCPProvider:
                 "target ID; retained"
             )
         if not settings_match(observed, resource):
+            changed = [
+                key
+                for key, wanted in resource.items()
+                if not settings_match(observed.get(key), wanted)
+            ]
             raise PiccoloError(
-                "Created resource settings differ from the request; retained"
+                "Created resource settings differ from the request; retained. "
+                f"Fields: {', '.join(changed)}"
             )
         if kind == "snapshot":
             original = document(operation.get("source_disk", {}))

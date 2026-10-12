@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from collections.abc import Callable, Generator
@@ -13,6 +14,8 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import patch
 from weakref import WeakSet
+
+from google.api_core import exceptions
 
 from piccolo.errors import PiccoloError
 
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
 TOTAL_SECONDS = 45 * 60
 CLEANUP_SECONDS = 5 * 60
 INVENTORY_SECONDS = 60
+SERVICE_USAGE_INTERVAL = 1.05
 type Phase = Literal["work", "cleanup", "inventory"]
 ACTIVE: ContextVar[Deadline | None] = ContextVar("piccolo_live_deadline", default=None)
 _BOUND_CLIENTS: WeakSet[object] = WeakSet()
@@ -31,12 +35,38 @@ _BOUND_CLIENTS: WeakSet[object] = WeakSet()
 class Deadline:
     """Share a monotonic deadline across all tests, RPCs, and teardown phases."""
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        total_seconds: int = TOTAL_SECONDS,
+    ) -> None:
         """Reserve the final five minutes, including one minute for inventory."""
         self.clock = clock
+        if not CLEANUP_SECONDS < total_seconds <= TOTAL_SECONDS:
+            raise PiccoloError(
+                "Live duration must exceed cleanup reserve and be at most 2700 seconds"
+            )
+        self.total_seconds = total_seconds
         self.started = clock()
         self.phase: Phase = "work"
         self.work_expired = False
+        self.last_service_usage: float | None = None
+
+    def pace_service_usage(self) -> None:
+        """Space Service Usage attempts across clients without exceeding this phase."""
+        if self.last_service_usage is not None:
+            delay = SERVICE_USAGE_INTERVAL - (self.clock() - self.last_service_usage)
+            if delay > 0:
+                if delay >= self.remaining():
+                    if self.phase == "work":
+                        self.work_expired = True
+                    raise PiccoloError(
+                        "Live deadline cannot accommodate Service Usage pacing"
+                    )
+                time.sleep(delay)
+        self.remaining()
+        self.last_service_usage = self.clock()
 
     def remaining(self) -> float:
         """Return the remaining time for this phase, raising before new calls."""
@@ -45,7 +75,9 @@ class Deadline:
             "cleanup": INVENTORY_SECONDS,
             "inventory": 0,
         }
-        remaining = self.started + TOTAL_SECONDS - reserve[self.phase] - self.clock()
+        remaining = (
+            self.started + self.total_seconds - reserve[self.phase] - self.clock()
+        )
         if remaining <= 0:
             if self.phase == "work":
                 self.work_expired = True
@@ -73,6 +105,15 @@ def check_work() -> None:
         current.remaining()
 
 
+def fixture_time_available() -> bool:
+    """Skip a new VM fixture when less than two work minutes remain."""
+    current = ACTIVE.get()
+    if current is not None and current.remaining() < 120:
+        current.work_expired = True
+        return False
+    return True
+
+
 def timeout(seconds: float = 30) -> float:
     """Bound one in-flight request by the current remaining phase allowance."""
     current = ACTIVE.get()
@@ -90,7 +131,12 @@ def phase(name: Phase) -> Generator[None]:
             yield
 
 
-def bounded_rpc(method: object) -> Callable[..., object]:
+def bounded_rpc(
+    method: object,
+    *,
+    retry_service_read: bool = False,
+    pace_service_usage: bool = False,
+) -> Callable[..., object]:
     """Wrap a generated SDK transport call, including pager's subsequent calls."""
     call = cast(Callable[..., object], method)
 
@@ -98,9 +144,19 @@ def bounded_rpc(method: object) -> Callable[..., object]:
         """Disable retries and recompute remaining time before every RPC."""
         supplied = kwargs.get("timeout")
         seconds = float(supplied) if isinstance(supplied, int | float) else 30.0
-        kwargs["timeout"] = timeout(min(30.0, seconds))
-        kwargs["retry"] = None
-        return call(*args, **kwargs)
+        for attempt in range(3):
+            current = ACTIVE.get()
+            if pace_service_usage and current is not None:
+                current.pace_service_usage()
+            kwargs["timeout"] = timeout(min(30.0, seconds))
+            kwargs["retry"] = None
+            try:
+                return call(*args, **kwargs)
+            except exceptions.ServiceUnavailable:
+                if not retry_service_read or attempt == 2:
+                    raise
+                time.sleep(timeout(0.5 * (attempt + 1)))
+        raise PiccoloError("Service Usage read attempts exhausted")
 
     return invoke
 
@@ -114,10 +170,17 @@ def bind_client(client: object) -> None:
     if not isinstance(methods, dict):
         raise PiccoloError("SDK client cannot enforce live RPC deadlines")
     mapping = cast(dict[object, object], methods)
+    from google.cloud import service_usage_v1
+
+    service_usage = isinstance(client, service_usage_v1.ServiceUsageClient)
     for key, method in mapping.items():
         if not callable(method):
             raise PiccoloError("Unexpected SDK transport method")
-        mapping[key] = bounded_rpc(method)
+        mapping[key] = bounded_rpc(
+            method,
+            retry_service_read=key == getattr(transport, "get_service", None),
+            pace_service_usage=service_usage,
+        )
     _BOUND_CLIENTS.add(client)
 
 
@@ -152,7 +215,13 @@ def live_session() -> Generator[Deadline]:
         return
     from piccolo.providers.gcp.connection import GCloudConnection
 
-    deadline = Deadline()
+    try:
+        total_seconds = int(
+            os.environ.get("PICCOLO_GCP_LIVE_SECONDS", str(TOTAL_SECONDS))
+        )
+    except ValueError as exc:
+        raise PiccoloError("PICCOLO_GCP_LIVE_SECONDS must be an integer") from exc
+    deadline = Deadline(total_seconds=total_seconds)
     token = ACTIVE.set(deadline)
     original_run = GCloudConnection.run
 

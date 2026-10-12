@@ -363,6 +363,7 @@ class SSHExpiryProbe:
 
     def establish(self) -> tuple[str, float]:
         """Prove successful SSH and finite authorization before waiting for expiry."""
+        self.connection.ready(self.zone)
         ready = self.connection.execute(self.zone, "printf authorized")
         if ready != "authorized":
             raise PiccoloError("Initial Piccolo SSH did not return its expected marker")

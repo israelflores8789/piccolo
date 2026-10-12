@@ -113,6 +113,7 @@ def validate_source(config: Config, instance: Document, disk: Document) -> None:
             "creation_timestamp",
             "status",
             "status_message",
+            "resource_status",
             "cpu_platform",
             "last_start_timestamp",
             "last_stop_timestamp",
@@ -152,6 +153,7 @@ def validate_source(config: Config, instance: Document, disk: Document) -> None:
             "creation_timestamp",
             "status",
             "size_gb",
+            "resource_status",
             "type_",
             "users",
             "labels",
@@ -197,6 +199,11 @@ def validate_source(config: Config, instance: Document, disk: Document) -> None:
     if attachment.get("mode", "READ_WRITE") != "READ_WRITE":
         raise PiccoloError("Unsupported read-only boot disk")
     reject_startup(document(instance.get("metadata", {})))
+    supported_fields(
+        document(instance.get("shielded_instance_integrity_policy", {})),
+        {"update_auto_learn_policy"},
+        "shielded integrity policy",
+    )
     if instance.get("deletion_protection"):
         raise PiccoloError(
             "Instance deletion protection is enabled; inspect before moving"
@@ -390,7 +397,6 @@ def instance_resource(
         for key in (
             "service_accounts",
             "shielded_instance_config",
-            "shielded_instance_integrity_policy",
             "scheduling",
             "description",
             "can_ip_forward",

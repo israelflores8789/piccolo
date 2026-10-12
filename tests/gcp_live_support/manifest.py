@@ -53,6 +53,11 @@ def resource_url(project: str, kind: str, name: str, zone: str = "") -> str:
         return f"https://iam.googleapis.com/v1/{project}/serviceAccounts/{name}"
     if kind == "secret":
         return f"https://secretmanager.googleapis.com/v1/{project}/secrets/{name}"
+    if kind == "recoverable_snapshot":
+        return (
+            "https://compute.googleapis.com/compute/beta/"
+            f"{project}/global/recoverableSnapshots/{name}"
+        )
     scope = f"zones/{zone}" if zone else "global"
     return f"https://www.googleapis.com/compute/v1/{project}/{scope}/{kind}s/{name}"
 
@@ -210,6 +215,10 @@ class CleanupBackend(Protocol):
         """Remove only an independently recorded disposable connection key."""
         ...
 
+    def purge_snapshots(self) -> None:
+        """Remove only recoverable snapshots with recorded original identities."""
+        ...
+
 
 def cleanup_actions(
     manifest: Manifest, backend: CleanupBackend, *, apply: bool = False
@@ -286,6 +295,12 @@ def cleanup_actions(
                     raise PiccoloError("Deletion not verified")
             except Exception as exc:
                 failures.append(f"{label}: {exc}")
+        if kind == "snapshot" and not failures:
+            try:
+                check_work()
+                backend.purge_snapshots()
+            except Exception as exc:
+                failures.append(f"Snapshot recycle-bin cleanup: {exc}")
     if not failures:
         for entry in manifest.entries("ssh_keys"):
             try:
@@ -304,7 +319,7 @@ def residual_report(
     leftovers: list[Document] = []
     unknown: list[str] = []
     with phase("inventory"):
-        for kind in RESOURCE_KINDS:
+        for kind in (*RESOURCE_KINDS, "recoverable_snapshot"):
             try:
                 check_work()
                 observed_resources = backend.inventory(kind)

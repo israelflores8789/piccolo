@@ -5,6 +5,15 @@
 
 Set PICCOLO_GCP_LIVE_PROJECT to the approved TOML project before live tests.
 The impersonation case also requires PICCOLO_GCP_LIVE_HUMAN_ADC.
+
+Before running, label every existing secret listed in gcp.iam.secrets with
+piccolo-live-dummy=true on the secret resource in GCP (for example, through
+the Google Cloud console). Listing a secret in TOML does not set this label.
+Each secret must contain TEST_thisisadummytestsecret_TEST, and the provisioner
+must have permission to read its payload. The harness checks both the label
+and the payload before granting the guest service account access, to avoid
+exposing real secrets to test VMs. Arrange these prerequisites out of band;
+the harness does not add the label or replace existing secret contents.
 """
 
 import json
@@ -22,7 +31,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from gcp_live_support.deadline import bind_client, check_work, timeout
+from gcp_live_support.deadline import (
+    ACTIVE,
+    bind_client,
+    check_work,
+    fixture_time_available,
+    timeout,
+)
 from gcp_live_support.gcp_live import (
     approval_digest,
     local_preflight,
@@ -57,13 +72,15 @@ def gcp_run(
         pytest.fail("Set PICCOLO_GCP_LIVE_CONFIG to the approved local TOML profile")
     base = profile(Path(path))
     local_preflight()
+    if not fixture_time_available():
+        pytest.skip("Less than two minutes of work time remain for a new VM fixture")
     from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
     from google.cloud import service_usage_v1
 
     from piccolo.providers.gcp.auth import credentials
     from piccolo.providers.gcp.clients import Clients
     from piccolo.providers.gcp.connection import GCloudConnection
-    from piccolo.providers.gcp.provider import GCPProvider
     from piccolo.state.lock import environment_lock
 
     run = f"plive-{uuid.uuid4().hex[:16]}"
@@ -76,7 +93,8 @@ def gcp_run(
     manifest.data["run_settings_fingerprint"] = config.fingerprint
     manifest.data["test"] = request.node.nodeid
     manifest.data["guest_account_variant"] = "created" if request.param else "existing"
-    manifest.data["deadline_seconds"] = 2700
+    deadline = ACTIVE.get()
+    manifest.data["deadline_seconds"] = deadline.total_seconds if deadline else 2700
     manifest.data["cleanup_command"] = (
         f"just janitor-gcp-live {shlex.quote(str(manifest.path))} 1"
     )
@@ -205,6 +223,34 @@ def verify_guest_secrets(provider: "GCPProvider", zone: str) -> None:
         print(f"Guest account accessed {secret}; payload verified without logging it")
 
 
+def test_live_move_settings_and_data(gcp_run: "GCPProvider") -> None:
+    """Exercise relocation settings, guest identity, and disk data."""
+    from piccolo.providers.gcp.provision import zone_of
+
+    provider = gcp_run
+    provider.init()
+    source = provider.active()
+    zone = zone_of(source)
+    assert provider.connection.execute(
+        zone,
+        "printf piccolo-move-sentinel > ~/piccolo-live-sentinel; "
+        "sha256sum ~/piccolo-live-sentinel",
+    )
+    before = provider.connection.execute(zone, "sha256sum ~/piccolo-live-sentinel")
+    destination = next(z for z in provider.gcp.zones if z != zone)
+    provider.move(destination)
+    moved = provider.active()
+    assert zone_of(moved) == destination
+    assert text(moved, "id") != text(source, "id")
+    assert (
+        provider.connection.execute(destination, "sha256sum ~/piccolo-live-sentinel")
+        == before
+    )
+    assert objects(moved, "service_accounts") == objects(source, "service_accounts")
+    assert moved["shielded_instance_config"] == source["shielded_instance_config"]
+    provider.cleanup(True)
+
+
 def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -> None:
     from piccolo.providers.gcp.provision import owned, zone_of
 
@@ -306,9 +352,8 @@ def test_live_ssh_key_expire_and_reconnect(
 ) -> None:
     """Prove expired-key rejection, then gcloud renewal on SSH and SCP reconnect."""
     from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
     from gcp_live_support.ssh_expiry import SSHExpiryProbe
-
-    from piccolo.providers.gcp.provider import GCPProvider
 
     assert isinstance(gcp_run.cloud, LiveCloud)
     gcp_run.cloud.ssh_login_mode = mode
@@ -439,8 +484,9 @@ def test_live_credential_guards_before_guest_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify H01/H02 guards against a real run-owned VM without unsafe refresh."""
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
+
     from piccolo.providers.gcp.connection import AUTH_OVERRIDES, GCloudConnection
-    from piccolo.providers.gcp.provider import GCPProvider
     from piccolo.providers.gcp.provision import zone_of
 
     provider = gcp_run
@@ -514,8 +560,8 @@ def test_live_later_fallback_recovery(
     staging, and relocation use real run-owned cloud resources.
     """
     from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
 
-    from piccolo.providers.gcp.provider import GCPProvider
     from piccolo.providers.gcp.provision import zone_of
 
     provider = gcp_run
@@ -601,7 +647,8 @@ def test_live_unknown_state_preserves_move_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify H04/H05 with real labels, IDs, a stopped source, and a snapshot."""
-    from piccolo.providers.gcp.provider import GCPProvider
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
+
     from piccolo.providers.gcp.provision import zone_of
 
     provider = gcp_run
@@ -648,6 +695,8 @@ def test_live_unknown_state_preserves_move_recovery(
 def test_live_shutdown_metadata_guards(
     gcp_run: "GCPProvider",
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    exercise_power: bool = True,
 ) -> None:
     """Attach only harmless instance hooks; project hooks use a read overlay."""
     from gcp_live_support.gcp_sdk import LiveCloud
@@ -693,8 +742,42 @@ def test_live_shutdown_metadata_guards(
             )
             with pytest.raises(PiccoloError, match="shutdown-script"):
                 provider.stop()
-    provider.stop()
-    provider.start()
+    if exercise_power:
+        provider.stop()
+        provider.start()
+
+
+def test_live_security_iap_and_recovery_sequence(
+    gcp_run: "GCPProvider",
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse one guest for credential, shutdown, tunnel, and recovery assertions."""
+    test_live_credential_guards_before_guest_access(gcp_run, tmp_path, monkeypatch)
+    test_live_shutdown_metadata_guards(gcp_run, monkeypatch, exercise_power=False)
+    test_human_iap_tunnel_and_interruption(gcp_run)
+    test_live_unknown_state_preserves_move_recovery(gcp_run, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("mode", ["oslogin", "metadata"])
+def test_live_ssh_expiry_transport_sequence(gcp_run: "GCPProvider", mode: str) -> None:
+    """Observe SSH and SCP expiration independently on one guest per login mode."""
+    from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.gcp_sdk import LiveProvider as GCPProvider
+    from gcp_live_support.ssh_expiry import SSHExpiryProbe
+
+    assert isinstance(gcp_run.cloud, LiveCloud)
+    gcp_run.cloud.ssh_login_mode = mode
+    provider = GCPProvider(replace(gcp_run.config, bootstrap=None), gcp_run.cloud)
+    provider.init()
+    for transport in ("ssh", "scp"):
+        probe = SSHExpiryProbe(provider, mode, transport)
+        initial = probe.establish()
+        probe.wait_until_rejected(initial[1])
+        probe.reconnect(initial)
+        print(
+            f"Verified {mode}/{transport}: expired-key rejection and same-key renewal"
+        )
 
 
 if TYPE_CHECKING:

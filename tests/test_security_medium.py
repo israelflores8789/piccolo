@@ -84,6 +84,80 @@ def test_private_defaults_and_finite_ssh_lifetime(config: Config) -> None:
     assert config.gcp.require_passphrase is False
 
 
+def test_move_accepts_output_only_resource_status_without_copying_it(
+    config: Config,
+) -> None:
+    """Allow Compute status observations while preserving strict request validation."""
+    from piccolo.providers.gcp.provision import validate_source
+
+    cloud = FakeCloud()
+    provider = GCPProvider(config, cloud, GuestConnection(config.path.parent / "guest"))
+    provider.init()
+    instance = provider.active()
+    disk = provider.disk(instance)
+    vm_status: Document = {
+        "effective_instance_metadata": {"enable_oslogin_metadata_value": True}
+    }
+    disk_status: Document = {"disk_consistency_status": "CONSISTENT"}
+    cloud.resources[("instance", config.gcp.name, "us-west1-a")]["resource_status"] = (
+        vm_status
+    )
+    disk_name = text(disk, "name")
+    cloud.resources[("disk", disk_name, "us-west1-a")]["resource_status"] = disk_status
+    validate_source(config, provider.active(), provider.disk(provider.active()))
+    provider.move("us-east1-b")
+    assert "resource_status" not in provider.active()
+    assert "resource_status" not in provider.disk(provider.active())
+
+
+@pytest.mark.parametrize("learned", [False, True])
+def test_move_omits_source_integrity_baseline_update_action(
+    config: Config, monkeypatch: pytest.MonkeyPatch, learned: bool
+) -> None:
+    """Preserve Shielded VM settings while a new VM establishes its own baseline."""
+    cloud = FakeCloud()
+    provider = GCPProvider(config, cloud, GuestConnection(config.path.parent / "guest"))
+    provider.init()
+    cloud.resources[("instance", config.gcp.name, "us-west1-a")][
+        "shielded_instance_integrity_policy"
+    ] = {"update_auto_learn_policy": learned}
+    source = provider.active()
+    submitted: list[Document] = []
+    original = cloud.submit
+
+    def submit(
+        kind: str, name: str, zone: str, resource: Document, request_id: str
+    ) -> str:
+        if kind == "instance.insert" and zone == "us-east1-b":
+            submitted.append(document(resource))
+        return original(kind, name, zone, resource, request_id)
+
+    monkeypatch.setattr(cloud, "submit", submit)
+    provider.move("us-east1-b")
+    assert len(submitted) == 1
+    assert "shielded_instance_integrity_policy" not in submitted[0]
+    assert (
+        provider.active()["shielded_instance_config"]
+        == source["shielded_instance_config"]
+    )
+
+
+def test_unknown_integrity_policy_settings_block_move_before_stop(
+    config: Config,
+) -> None:
+    """Retain strict handling of future nondefault integrity policy configuration."""
+    cloud = FakeCloud()
+    provider = GCPProvider(config, cloud, GuestConnection(config.path.parent / "guest"))
+    provider.init()
+    cloud.resources[("instance", config.gcp.name, "us-west1-a")][
+        "shielded_instance_integrity_policy"
+    ] = {"future_policy": True}
+    cloud.calls.clear()
+    with pytest.raises(PiccoloError, match="shielded integrity policy"):
+        provider.move("us-east1-b")
+    assert not cloud.calls
+
+
 @pytest.mark.parametrize("source", ["0.0.0.0/0", "10.0.0.0/8", "::/0"])
 def test_iap_source_ranges_cannot_widen(config_path: Path, source: str) -> None:
     config_path.write_text(

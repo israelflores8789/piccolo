@@ -4,13 +4,14 @@
 """gcp_sdk.py — Manifest-backed test adapter; never used by ordinary CLI commands."""
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable
 from typing import override
 
 from google.api_core import exceptions
-from google.cloud import compute_v1, iam_admin_v1, secretmanager_v1
+from google.cloud import compute_v1, iam_admin_v1, resourcemanager_v3, secretmanager_v1
 from google.iam.v1 import iam_policy_pb2, options_pb2, policy_pb2
 
 from gcp_live_support.deadline import bind_clients, check_work, timeout
@@ -21,6 +22,7 @@ from piccolo.errors import PiccoloError, UncertainError
 from piccolo.providers.gcp.access import Access, add_binding
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.operations import failure
+from piccolo.providers.gcp.provider import GCPProvider
 from piccolo.providers.gcp.provision import labels
 from piccolo.providers.gcp.resources import READ_RETRY, SDKCloud
 
@@ -43,10 +45,9 @@ class LiveCloud(SDKCloud):
             config.gcp.project_id != text(manifest.data, "project")
             or config.environment != text(manifest.data, "run")
             or config.gcp.enable_apis
-            or config.gcp.project_roles
         ):
             raise PiccoloError(
-                "Live runs require matching project/run, pre-enabled APIs, no roles"
+                "Live runs require matching project/run and pre-enabled APIs"
             )
         super().__init__(config, clients)
         bind_clients(clients)
@@ -59,6 +60,14 @@ class LiveCloud(SDKCloud):
         """Inspect fixture resources without conflating absence and read errors."""
         try:
             match kind:
+                case "project":
+                    if name != self.project:
+                        raise PiccoloError("Project policy target is outside approval")
+                    project = self.clients.projects.get_project(
+                        name=f"projects/{self.project}", retry=READ_RETRY, timeout=30
+                    )
+                    result = decode(resourcemanager_v3.Project.to_json(project))
+                    result["id"] = project.name
                 case "account":
                     account = self.clients.iam.get_service_account(
                         name=f"projects/{self.project}/serviceAccounts/{name}",
@@ -90,7 +99,24 @@ class LiveCloud(SDKCloud):
                 case _:
                     result = super().get(kind, name, zone)
         except exceptions.NotFound:
-            return None
+            entry = self.manifest.lookup(kind, name, zone)
+            if (
+                kind != "account"
+                or entry is None
+                or entry.get("absent_before") is not True
+                or not text(entry, "id")
+            ):
+                return None
+            # IAM reads can temporarily disagree after account creation/deletion.
+            for account in self.clients.iam.list_service_accounts(
+                name=f"projects/{self.project}", retry=READ_RETRY, timeout=30
+            ):
+                if account.email == name:
+                    result = decode(iam_admin_v1.ServiceAccount.to_json(account))
+                    result["id"] = account.unique_id
+                    break
+            else:
+                return None
         if result:
             entry = self.manifest.lookup(kind, name, zone)
             if entry and not text(entry, "id") and self.owns(entry, result):
@@ -105,9 +131,13 @@ class LiveCloud(SDKCloud):
         kind = text(entry, "kind")
         run = text(self.manifest.data, "run")
         if entry.get("preserve") is True:
-            allowed = (kind == "secret" and name in self.config.gcp.secrets) or (
-                kind == "account"
-                and name == self.config.gcp.auth.impersonate_service_account
+            allowed = (
+                (kind == "secret" and name in self.config.gcp.secrets)
+                or (
+                    kind == "account"
+                    and name == self.config.gcp.auth.impersonate_service_account
+                )
+                or (kind == "project" and name == self.project)
             )
             return (
                 allowed
@@ -192,9 +222,13 @@ class LiveCloud(SDKCloud):
 
     def preserve_external(self, kind: str, name: str) -> None:
         """Track an approved existing policy target without authorizing deletion."""
-        allowed = (kind == "secret" and name in self.config.gcp.secrets) or (
-            kind == "account"
-            and name == self.config.gcp.auth.impersonate_service_account
+        allowed = (
+            (kind == "secret" and name in self.config.gcp.secrets)
+            or (
+                kind == "account"
+                and name == self.config.gcp.auth.impersonate_service_account
+            )
+            or (kind == "project" and name == self.project)
         )
         if not allowed:
             raise PiccoloError("Existing target was not explicitly approved")
@@ -285,6 +319,28 @@ class LiveCloud(SDKCloud):
             self.manifest.put("actions", action)
             raise
 
+    def instance_settings(self, resource: Document) -> Document:
+        """Apply explicit fixture login metadata before submission and verification."""
+        resource = document(resource)
+        metadata = document(resource.get("metadata", {}))
+        items = objects(metadata, "items")
+        if self.ssh_login_mode not in {"oslogin", "metadata"}:
+            raise PiccoloError("Unsupported live SSH login mode")
+        if not any(text(item, "key") == "enable-oslogin" for item in items):
+            items.append(
+                {
+                    "key": "enable-oslogin",
+                    "value": "TRUE" if self.ssh_login_mode == "oslogin" else "FALSE",
+                }
+            )
+        if self.ssh_login_mode == "metadata" and not any(
+            text(item, "key") == "block-project-ssh-keys" for item in items
+        ):
+            items.append({"key": "block-project-ssh-keys", "value": "TRUE"})
+        metadata["items"] = [item for item in items]
+        resource["metadata"] = metadata
+        return resource
+
     @override
     def submit(
         self, kind: str, name: str, zone: str, resource: Document, request_id: str
@@ -295,26 +351,7 @@ class LiveCloud(SDKCloud):
         resource_kind, verb = kind.split(".")
         if verb == "insert":
             if resource_kind == "instance":
-                resource = document(resource)
-                metadata = document(resource.get("metadata", {}))
-                items = objects(metadata, "items")
-                if self.ssh_login_mode not in {"oslogin", "metadata"}:
-                    raise PiccoloError("Unsupported live SSH login mode")
-                if not any(text(item, "key") == "enable-oslogin" for item in items):
-                    items.append(
-                        {
-                            "key": "enable-oslogin",
-                            "value": "TRUE"
-                            if self.ssh_login_mode == "oslogin"
-                            else "FALSE",
-                        }
-                    )
-                if self.ssh_login_mode == "metadata" and not any(
-                    text(item, "key") == "block-project-ssh-keys" for item in items
-                ):
-                    items.append({"key": "block-project-ssh-keys", "value": "TRUE"})
-                metadata["items"] = [item for item in items]
-                resource["metadata"] = metadata
+                resource = self.instance_settings(resource)
             self.prepare(
                 resource_kind, name, zone, {"labels": resource.get("labels", {})}
             )
@@ -428,6 +465,10 @@ class LiveCloud(SDKCloud):
     def inventory(self, kind: str) -> list[Document]:
         """Enumerate globally or across every zone, including replacement candidates."""
         match kind:
+            case "recoverable_snapshot":
+                from gcp_live_support.recycle_bin import RecycleBin
+
+                return RecycleBin(self.project, self.clients.credentials).inventory()
             case "account":
                 return [
                     decode(iam_admin_v1.ServiceAccount.to_json(a))
@@ -451,6 +492,12 @@ class LiveCloud(SDKCloud):
                 ]
             case _:
                 return self.list(kind)
+
+    def purge_snapshots(self) -> None:
+        """Purge only original snapshot identities proven by this run's manifest."""
+        from gcp_live_support.recycle_bin import RecycleBin
+
+        RecycleBin(self.project, self.clients.credentials).purge(self.manifest)
 
     def remove_ssh_key(self, entry: Document) -> None:
         """Use the configured connector to clean up its exact disposable test key."""
@@ -541,6 +588,12 @@ class LiveCloud(SDKCloud):
             resource=resource,
             options=options_pb2.GetPolicyOptions(requested_policy_version=3),
         )
+        if kind == "project":
+            if resource != f"projects/{self.project}":
+                raise PiccoloError("Project policy target is outside approval")
+            return self.clients.projects.get_iam_policy(
+                request=request, retry=READ_RETRY, timeout=30
+            )
         if kind == "account":
             return self.clients.iam.get_iam_policy(
                 request=request, retry=READ_RETRY, timeout=30
@@ -556,8 +609,13 @@ class LiveCloud(SDKCloud):
         name = resource.rsplit("/", 1)[-1]
         entry = self.manifest.lookup(kind, name)
         observed = self.get(kind, name)
+        expected_resource = (
+            f"projects/{self.project}"
+            if kind == "project"
+            else f"projects/{self.project}/{scope}/{name}"
+        )
         if (
-            resource != f"projects/{self.project}/{scope}/{name}"
+            resource != expected_resource
             or entry is None
             or observed is None
             or not self.owns(entry, observed)
@@ -566,7 +624,11 @@ class LiveCloud(SDKCloud):
         if not policy.etag:
             raise PiccoloError("Refusing IAM write without an etag")
         request = iam_policy_pb2.SetIamPolicyRequest(resource=resource, policy=policy)
-        if kind == "account":
+        if kind == "project":
+            self.clients.projects.set_iam_policy(
+                request=request, retry=None, timeout=30
+            )
+        elif kind == "account":
             self.clients.iam.set_iam_policy(request=request, retry=None, timeout=30)
         else:
             self.clients.secrets.set_iam_policy(request=request, retry=None, timeout=30)
@@ -574,16 +636,37 @@ class LiveCloud(SDKCloud):
     def binding(self, kind: str, name: str, role: str, member: str) -> None:
         """Record only a missing grant on a proven fixture-owned policy target."""
         gate(self.project)
+        if kind == "project":
+            self.check_project_binding(name, role, member)
+            self.preserve_external(kind, name)
         entry = self.manifest.lookup(kind, name)
         observed = self.get(kind, name)
         if entry is None or observed is None or not self.owns(entry, observed):
             raise PiccoloError("IAM mutation target is not run-owned")
         resource = (
-            f"projects/{self.project}/serviceAccounts/{name}"
-            if kind == "account"
-            else f"projects/{self.project}/secrets/{name}"
+            f"projects/{self.project}"
+            if kind == "project"
+            else (
+                f"projects/{self.project}/serviceAccounts/{name}"
+                if kind == "account"
+                else f"projects/{self.project}/secrets/{name}"
+            )
         )
         policy = self.policy(kind, resource)
+        guest_id = ""
+        if kind == "project":
+            guest = self.get("account", self.config.gcp.service_account)
+            if guest is None or not text(guest, "id"):
+                raise PiccoloError("Project grant guest identity is unavailable")
+            guest_id = text(guest, "id")
+        if any(
+            b.role == role and member in b.members and b.HasField("condition")
+            for b in policy.bindings
+        ) and not any(
+            b.role == role and member in b.members and not b.HasField("condition")
+            for b in policy.bindings
+        ):
+            raise PiccoloError("Conditional-only IAM access; refusing to widen it")
         if not add_binding(policy, role, member):
             return
         binding: Document = {
@@ -595,13 +678,41 @@ class LiveCloud(SDKCloud):
             "member": member,
             "target_id": text(observed, "id"),
             "absent_before": True,
+            "guest_id": guest_id,
         }
         self.manifest.put("bindings", binding)
         self.set_policy(kind, resource, policy)
 
+    def check_project_binding(self, name: str, role: str, member: str) -> None:
+        """Limit project grants to approved roles and the exact guest identity."""
+        gate(self.project)
+        if (
+            name != self.project
+            or role not in self.config.gcp.project_roles
+            or member != f"serviceAccount:{self.config.gcp.service_account}"
+        ):
+            raise PiccoloError("Project IAM grant is outside the approved guest roles")
+
     def remove_binding(self, entry: Document) -> None:
         """Remove only a recorded absent-before member; retain unrelated conditions."""
         kind, name = text(entry, "kind"), text(entry, "name")
+        if kind == "project":
+            self.check_project_binding(name, text(entry, "role"), text(entry, "member"))
+            current = self.policy(kind, f"projects/{self.project}")
+            if not any(
+                b.role == text(entry, "role")
+                and text(entry, "member") in b.members
+                and not b.HasField("condition")
+                for b in current.bindings
+            ):
+                return
+            guest = self.get("account", self.config.gcp.service_account)
+            if (
+                guest is None
+                or not text(entry, "guest_id")
+                or text(guest, "id") != text(entry, "guest_id")
+            ):
+                raise PiccoloError("Project grant guest identity changed")
         observed = self.get(kind, name)
         if observed is None:
             return
@@ -615,9 +726,13 @@ class LiveCloud(SDKCloud):
             raise PiccoloError("IAM target identity changed; preserving policy")
         resource = text(entry, "resource")
         expected_resource = (
-            f"projects/{self.project}/serviceAccounts/{name}"
-            if kind == "account"
-            else f"projects/{self.project}/secrets/{name}"
+            f"projects/{self.project}"
+            if kind == "project"
+            else (
+                f"projects/{self.project}/serviceAccounts/{name}"
+                if kind == "account"
+                else f"projects/{self.project}/secrets/{name}"
+            )
         )
         if resource != expected_resource:
             raise PiccoloError("IAM resource is outside the recorded target")
@@ -640,6 +755,14 @@ class LiveCloud(SDKCloud):
                 entry["cleanup_status"] = "intent"
                 self.manifest.put("bindings", entry)
                 self.set_policy(kind, resource, policy)
+                verified = self.policy(kind, resource)
+                if any(
+                    b.role == text(entry, "role")
+                    and text(entry, "member") in b.members
+                    and not b.HasField("condition")
+                    for b in verified.bindings
+                ):
+                    raise PiccoloError("IAM grant removal was not verified")
                 entry["cleanup_status"] = "removed"
                 self.manifest.put("bindings", entry)
                 return
@@ -674,6 +797,43 @@ class LiveCloud(SDKCloud):
     def access(self) -> None:
         """Use manifest-aware access reconciliation, preserving enabled APIs."""
         LiveAccess(self).ensure()
+
+
+class LiveProvider(GCPProvider):
+    """Verify the actual fixture settings on creation and every recovery path."""
+
+    @override
+    def created(self, kind: str, name: str, zone: str, resource: Document) -> Document:
+        """Include approved test login metadata in the expected instance settings."""
+        if not isinstance(self.cloud, LiveCloud):
+            raise PiccoloError("Live provider requires the manifest-backed adapter")
+        initial_zone = os.environ.get("PICCOLO_GCP_LIVE_INIT_ZONE", "")
+        if (
+            initial_zone
+            and self.journal.operation.get("kind") == "init"
+            and kind in {"disk", "instance"}
+            and zone != initial_zone
+        ):
+            raise PiccoloError(
+                "Initial creation outside the approved initial zone is blocked"
+            )
+        if kind == "instance":
+            resource = self.cloud.instance_settings(resource)
+        try:
+            return super().created(kind, name, zone, resource)
+        except PiccoloError as exc:
+            if "settings differ from the request" in str(exc):
+                observed = self.cloud.get(kind, name, zone)
+                self.cloud.manifest.put(
+                    "verification",
+                    {
+                        "key": f"{kind}:{zone}:{name}",
+                        "expected": resource,
+                        "observed": observed,
+                        "error": str(exc),
+                    },
+                )
+            raise
 
 
 class LiveAccess(Access):
@@ -764,9 +924,17 @@ class LiveAccess(Access):
 
     @override
     def grant(self, resource: str, role: str, *, secret: bool) -> None:
-        """Grant configured access only on the run's dummy secret."""
+        """Track approved project and dummy-secret grants for exact restoration."""
         if not secret:
-            raise PiccoloError("Live tests do not alter project IAM")
+            if resource != f"projects/{self.gcp.project_id}":
+                raise PiccoloError("Project IAM target is outside approval")
+            self.cloud.binding(
+                "project",
+                self.gcp.project_id,
+                role,
+                f"serviceAccount:{self.gcp.service_account}",
+            )
+            return
         self.cloud.binding(
             "secret",
             resource.rsplit("/", 1)[-1],

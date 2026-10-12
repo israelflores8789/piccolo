@@ -142,6 +142,21 @@ When the USER explicitly requests live testing against GCP (or any other live pr
 - You will KEEP or UPDATE a just recipe specific to the live test for a given provider (e.g. `just test-gcp-live`) including related recipes (e.g. `just janitor-gcp-live`).
 - ALL tests, including purely helper source code, belong in the `tests/` directory.
 
+- USE the following rates for estimation of charges associated with live GCP testing:
+  - Compute Engine VM Instance `e2-small`: $0.016752855 per hour.
+  - Disk Standard: $0.000054795 per gigabyte-hour.
+  - Snapshot Standard Storage: $0.000068493 per gigabyte-hour (note: make sure to remove the snapshot from the Snapshot Recycle Bin when tests are completed!).
+  - Disk recreated from a Snapshot in a different **region** (not zone) than the snapshot incurs Data Transfer rates: $0.02 per gigabyte for North America to North America transfers.
+  - Ephemeral/Static Public IPv4: $0.005 per hour.
+  - Reserved Static Public IPv4: $0.01 per hour.
+  - Networking charges:
+    - Ingress, Internet --> VM instance: free.
+    - VM <--> VM intra-zone, intra-region: free.
+    - VM <--> VM inter-zone, intra-region: $0.01 per gigabyte.
+    - VM <--> VM inter-zone, inter-region: $0.02 per gigabyte.
+    - Egress, VM --> Internet: $0.12 per gigabyte.
+  - Standard VPC Firewall: free.
+
 ### Prohibitions
 
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:

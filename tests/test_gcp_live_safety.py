@@ -6,6 +6,7 @@
 Live use requires PICCOLO_GCP_LIVE_PROJECT; offline fixtures set it locally.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from piccolo.errors import PiccoloError
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.connection import GCloudConnection
 from piccolo.providers.gcp.provision import labels
+from piccolo.providers.gcp.resources import READ_RETRY
 
 TEST_PROJECT = "piccolo-offline-tests"
 RUN = "plive-0123456789abcdef"
@@ -131,6 +133,10 @@ class MemoryBackend:
 
     def remove_ssh_key(self, entry: Document) -> None:
         self.ssh_keys_removed.append(text(entry, "key"))
+
+    def purge_snapshots(self) -> None:
+        """Represent a backend with no recoverable snapshots."""
+        return
 
     def add(self, kind: str, suffix: str, *, zone: str = "") -> Document:
         name = f"{RUN}-{suffix}"
@@ -764,6 +770,85 @@ def test_iam_cleanup_preserves_conditions_members_and_fresh_etag(
     assert updated.bindings[1].members == [member]
 
 
+def test_reopened_manifest_preserves_secret_cleanup_identifiers(
+    manifest: Manifest,
+) -> None:
+    """Recover secret deletion and IAM removal from persisted public identities."""
+    backend = MemoryBackend(manifest)
+    entry = backend.add("secret", "dummy")
+    resource = f"projects/{TEST_PROJECT}/secrets/{text(entry, 'name')}"
+    role = "roles/secretmanager.secretAccessor"
+    member = f"serviceAccount:{RUN}-vm@{TEST_PROJECT}.iam.gserviceaccount.com"
+    key = f"{resource}:{role}:{member}"
+    binding: Document = {
+        "key": key,
+        "kind": "secret",
+        "name": text(entry, "name"),
+        "resource": resource,
+        "role": role,
+        "member": member,
+        "target_id": "dummy",
+        "absent_before": True,
+    }
+    manifest.put("bindings", binding)
+    reopened = Manifest.open(manifest.path)
+    assert reopened.lookup("secret", text(entry, "name")) == entry
+    assert reopened.entries("bindings") == [binding]
+    backend.manifest = reopened
+    assert cleanup(reopened, backend, apply=True) == []
+    assert backend.deleted == [text(entry, "key")]
+    assert backend.bindings_removed == [key]
+    assert reopened.data["complete"] is True
+
+
+def test_live_recipe_preserves_pytest_argument_boundaries(tmp_path: Path) -> None:
+    """Pass spaced selections and literal shell syntax through the live recipe."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    stub = binary / "uv"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "# Copyright 2026 Israel Flores-Arbolay\n"
+        "# SPDX-License-Identifier: Apache-2.0\n"
+        '"""uv — Record arguments without running cloud clients."""\n'
+        "import json, sys\nfrom pathlib import Path\n"
+        "Path('.test_logs').mkdir(exist_ok=True)\n"
+        "if 'pytest' in sys.argv:\n"
+        "    Path('arguments.json').write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    stub.chmod(0o700)
+    environment = os.environ.copy()
+    environment["PATH"] = str(binary) + os.pathsep + environment["PATH"]
+    environment["PICCOLO_GCP_LIVE_PROJECT"] = TEST_PROJECT
+    environment["PICCOLO_GCP_LIVE_APPROVAL_SHA256"] = "offline-review"
+    profile_path = "approved profile $(touch unexpected-file).toml"
+    selection = "credential_guards or shutdown_metadata"
+    result = subprocess.run(
+        [
+            "just",
+            "--justfile",
+            str(Path("justfile").resolve()),
+            "--working-directory",
+            str(tmp_path),
+            "test-gcp-live",
+            profile_path,
+            "tests/test_gcp_live.py",
+            "-k",
+            selection,
+            "--maxfail=1",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    arguments: list[str] = json.loads((tmp_path / "arguments.json").read_text())
+    assert arguments[-4:] == ["tests/test_gcp_live.py", "-k", selection, "--maxfail=1"]
+    assert not (tmp_path / "unexpected-file").exists()
+
+
 def test_default_collection_is_cloud_free_even_with_opt_in_environment(
     approved: Config,
 ) -> None:
@@ -1140,3 +1225,235 @@ def test_login_mode_is_selected_before_first_vm_access(
     assert settings["enable-oslogin"] == ("TRUE" if mode == "oslogin" else "FALSE")
     if mode == "metadata":
         assert settings["block-project-ssh-keys"] == "TRUE"
+
+
+@pytest.mark.parametrize(
+    "baseline", ["absent", "present", "conditional", "interrupted"]
+)
+def test_project_grant_restoration_preserves_baseline_and_concurrent_changes(
+    approved: Config, manifest: Manifest, monkeypatch: pytest.MonkeyPatch, baseline: str
+) -> None:
+    """Recover a durable project grant without removing existing or later grants."""
+    approved = replace(
+        approved, gcp=replace(approved.gcp, project_roles=("roles/compute.viewer",))
+    )
+    clients = Clients(AnonymousCredentials())
+    cloud = LiveCloud(approved, clients, manifest)
+    member = f"serviceAccount:{approved.gcp.service_account}"
+    stored = policy_pb2.Policy(version=3, etag=b"original")
+    stored.bindings.add(role="roles/viewer", members=["user:other@example.com"])
+    if baseline in {"present", "conditional"}:
+        binding = stored.bindings.add(role="roles/compute.viewer", members=[member])
+        if baseline == "conditional":
+            binding.condition.expression = (
+                "request.time < timestamp('2030-01-01T00:00:00Z')"
+            )
+    original = policy_pb2.Policy()
+    original.CopyFrom(stored)
+    monkeypatch.setattr(
+        clients.projects,
+        "get_project",
+        Mock(
+            return_value=resourcemanager_v3.Project(
+                name="projects/123", project_id=TEST_PROJECT
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        clients.iam,
+        "get_service_account",
+        Mock(return_value=iam_admin_v1.ServiceAccount(unique_id="guest-original")),
+    )
+
+    def read(
+        *, request: iam_policy_pb2.GetIamPolicyRequest, retry: object, timeout: int
+    ) -> policy_pb2.Policy:
+        del retry, timeout
+        assert request.resource == f"projects/{TEST_PROJECT}"
+        assert request.options.requested_policy_version == 3
+        result = policy_pb2.Policy()
+        result.CopyFrom(stored)
+        return result
+
+    def write(
+        *, request: iam_policy_pb2.SetIamPolicyRequest, retry: None, timeout: int
+    ) -> None:
+        del retry, timeout
+        assert request.resource == f"projects/{TEST_PROJECT}"
+        assert request.policy.etag == stored.etag
+        assert Manifest.open(manifest.path).entries("bindings")
+        stored.CopyFrom(request.policy)
+        if baseline == "interrupted" and setter.call_count == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(clients.projects, "get_iam_policy", read)
+    setter = Mock(side_effect=write)
+    monkeypatch.setattr(clients.projects, "set_iam_policy", setter)
+    if baseline == "conditional":
+        with pytest.raises(PiccoloError, match="Conditional-only"):
+            LiveAccess(cloud).grant(
+                f"projects/{TEST_PROJECT}", "roles/compute.viewer", secret=False
+            )
+        assert stored == original
+        setter.assert_not_called()
+        return
+    if baseline == "interrupted":
+        with pytest.raises(KeyboardInterrupt):
+            LiveAccess(cloud).grant(
+                f"projects/{TEST_PROJECT}", "roles/compute.viewer", secret=False
+            )
+    else:
+        LiveAccess(cloud).grant(
+            f"projects/{TEST_PROJECT}", "roles/compute.viewer", secret=False
+        )
+    stored.bindings.add(role="roles/compute.viewer", members=["user:later@example.com"])
+    restored = LiveCloud(approved, clients, Manifest.open(manifest.path))
+    for entry in restored.manifest.entries("bindings"):
+        restored.remove_binding(entry)
+    original.bindings.add(
+        role="roles/compute.viewer", members=["user:later@example.com"]
+    )
+    assert stored == original
+    if baseline == "present":
+        setter.assert_not_called()
+
+
+@pytest.mark.parametrize("mismatch", ["project", "role", "member"])
+def test_project_grant_rejects_unapproved_scope_before_cloud_access(
+    approved: Config, manifest: Manifest, monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    """Reject project, role, and guest overrides before reading or writing IAM."""
+    approved = replace(
+        approved, gcp=replace(approved.gcp, project_roles=("roles/compute.viewer",))
+    )
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    getter = Mock()
+    monkeypatch.setattr(cloud, "get", getter)
+    with pytest.raises(PiccoloError, match="approved guest roles"):
+        cloud.binding(
+            "project",
+            "other-project" if mismatch == "project" else TEST_PROJECT,
+            "roles/owner" if mismatch == "role" else "roles/compute.viewer",
+            "user:other@example.com"
+            if mismatch == "member"
+            else f"serviceAccount:{approved.gcp.service_account}",
+        )
+    getter.assert_not_called()
+
+
+def test_run_config_retains_approved_project_roles(
+    approved: Config, tmp_path: Path
+) -> None:
+    """Keep guest role approval in each fixture's fingerprint and recovery config."""
+    approved = replace(
+        approved, gcp=replace(approved.gcp, project_roles=("roles/compute.viewer",))
+    )
+    generated = run_config(approved, tmp_path / "generated", RUN, create_account=False)
+    assert generated.gcp.project_roles == approved.gcp.project_roles
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("mode", ["oslogin", "metadata"])
+def test_fixture_login_metadata_is_verified_on_creation_and_resume(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
+    mode: str,
+) -> None:
+    """Exercise strict creation verification after genuine fixture metadata overlay."""
+    from conftest import FakeCloud
+    from gcp_live_support.gcp_sdk import LiveProvider
+
+    from piccolo.errors import UncertainError
+
+    fake = FakeCloud()
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    cloud.ssh_login_mode = mode
+    for method in (
+        "get",
+        "list",
+        "submit",
+        "poll",
+        "recover",
+        "access",
+        "access_plan",
+        "subnet",
+        "project_metadata",
+        "connection_policy",
+        "host_keys",
+    ):
+        monkeypatch.setattr(cloud, method, getattr(fake, method))
+    if interrupted:
+        fake.lost_response.add(("instance.insert", ZONE))
+    provider = LiveProvider(approved, cloud)
+    if interrupted:
+        with pytest.raises(UncertainError):
+            provider.init()
+        provider = LiveProvider(approved, cloud)
+        provider.resume()
+    else:
+        provider.init()
+    assert not provider.journal.operation
+    metadata = document(provider.active()["metadata"])
+    settings = {text(i, "key"): text(i, "value") for i in objects(metadata, "items")}
+    assert settings["enable-oslogin"] == ("TRUE" if mode == "oslogin" else "FALSE")
+    if mode == "metadata":
+        assert settings["block-project-ssh-keys"] == "TRUE"
+    assert sum(kind == "instance.insert" for kind, *_ in fake.calls) == 1
+
+
+def test_initial_zone_restriction_blocks_capacity_fallback_before_cloud_access(
+    approved: Config, manifest: Manifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep initial placement within an operator's narrower zone authorization."""
+    from gcp_live_support.gcp_sdk import LiveProvider
+
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_INIT_ZONE", ZONE)
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    getter = Mock()
+    monkeypatch.setattr(cloud, "get", getter)
+    provider = LiveProvider(approved, cloud)
+    provider.journal.begin({"kind": "init"})
+    with pytest.raises(PiccoloError, match="initial zone"):
+        provider.created("disk", "candidate-boot", "us-east1-b", {})
+    getter.assert_not_called()
+
+
+@pytest.mark.parametrize("listed_id", ["original", "replacement", "absent"])
+def test_recorded_account_notfound_is_checked_against_inventory(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+    listed_id: str,
+) -> None:
+    """Avoid dropping a created account after an inconsistent direct IAM read."""
+    cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
+    name = approved.gcp.service_account
+    entry = manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
+    entry["id"] = "original"
+    manifest.put("resources", entry)
+    monkeypatch.setattr(
+        cloud.clients.iam,
+        "get_service_account",
+        Mock(side_effect=exceptions.NotFound("temporary absence")),
+    )
+    lister = Mock(
+        return_value=[]
+        if listed_id == "absent"
+        else [
+            iam_admin_v1.ServiceAccount(
+                email=name, unique_id=listed_id, display_name=f"Piccolo {RUN}"
+            )
+        ]
+    )
+    monkeypatch.setattr(cloud.clients.iam, "list_service_accounts", lister)
+    observed = cloud.get("account", name)
+    lister.assert_called_once_with(
+        name=f"projects/{TEST_PROJECT}", retry=READ_RETRY, timeout=30
+    )
+    if listed_id == "absent":
+        assert observed is None
+    else:
+        assert observed is not None
+        assert cloud.owns(entry, observed) is (listed_id == "original")

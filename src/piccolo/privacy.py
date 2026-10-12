@@ -19,9 +19,9 @@ _SENSITIVE = re.compile(
     r"encryption.?key|signed.?url)"
 )
 _ASSIGNMENT = re.compile(
-    r"(?i)([\"']?(?:[\w.-]*(?:password|passwd|passphrase|secret|credential|"
+    r"(?i)(?<![\w./:-])([\"']?(?:[\w.-]*(?:password|passwd|passphrase|secret|credential|"
     r"private[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|"
-    r"api[_-]?key|client[_-]?secret|authorization|token)[\w.-]*)[\"']?\s*[:=]\s*)"
+    r"api[_-]?key|client[_-]?secret|authorization|token)[\w.-]*)[\"']?\s*(?:=(?!=)|:(?!:))\s*)"
     r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&}]+)"
 )
 _PEM = re.compile(
