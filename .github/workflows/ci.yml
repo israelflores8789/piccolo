@@ -1,0 +1,144 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Local only unit tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    - name: Set up just
+      uses: extractions/setup-just@v4
+
+    - name: Install development dependencies
+      run: uv sync --locked --all-groups --extra gcp
+
+    - name: Run unit tests
+      uses: pavelzw/pytest-action@v2
+      with:
+        verbose: true
+        emoji: true
+        job-summary: true
+        report-title: "Piccolo unit tests"
+        custom-pytest: uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
+        custom-arguments: '-s -m "not gcp_live" --junitxml=junit.xml'
+
+    - name: Save JUnit test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-unit-test-results
+        path: junit.xml
+        if-no-files-found: warn
+        retention-days: 14
+
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    - name: Set up just
+      uses: extractions/setup-just@v4
+
+    - name: Install development dependencies
+      run: uv sync --locked --all-groups --extra gcp
+
+    - name: Check formatting and lint
+      run: just lint
+
+    - name: Check types
+      run: just typecheck
+
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+    - name: Check out repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        enable-cache: true
+
+    - name: Install development dependencies
+      run: uv sync --locked --all-groups
+
+    - name: Build distributions
+      run: uv build --no-sources
+
+    - name: Validate distributions
+      run: uv run --locked twine check --strict dist/*
+
+  gate:
+    name: CI gate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    # Add each blocking CI job to this list and the result check below.
+    needs: [unit, lint, build]
+    if: always()
+    steps:
+    - name: Evaluate results
+      env:
+        UNIT: ${{ needs.unit.result }}
+        LINT: ${{ needs.lint.result }}
+        BUILD: ${{ needs.build.result }}
+      run: |
+        set -euo pipefail
+        echo "unit=$UNIT lint=$LINT build=$BUILD"
+        for result in "$UNIT" "$LINT" "$BUILD"; do
+          [ "$result" = "success" ] || exit 1
+        done

@@ -1,0 +1,217 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+# Piccolo development commands
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+pytest := "uv run --locked pytest"
+src_dir := "src"
+check_dirs := "src tests"
+
+lock:
+    uv lock
+
+lock-check:
+    uv lock --check
+
+install-dev:
+    @echo "Installing development dependencies..."
+    @uv sync --locked --all-groups --all-extras
+
+test *args:
+    {{pytest}} -v -s {{args}}
+
+# Set PICCOLO_GCP_LIVE_PROJECT directly or load it with --dotenv-path.
+approval-gcp-live config:
+    uv run --locked python tests/gcp_approval.py "{{ config }}"
+
+[positional-arguments]
+test-gcp-live config test-name="tests/test_gcp_live.py" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
+    : "${PICCOLO_GCP_LIVE_APPROVAL_SHA256:?Pin the reviewed digest from just approval-gcp-live}"
+    config="$1"
+    test_name="$2"
+    shift 2
+    log_file="${PICCOLO_GCP_LIVE_LOG:-.test_logs/pytest-gcp-live.log}"
+    PICCOLO_GCP_LIVE_LOG="$log_file" uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(os.environ["PICCOLO_GCP_LIVE_LOG"]), create=True))'
+    PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="$config" \
+        {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "$test_name" "$@" < /dev/null \
+        2>&1 | tee "$log_file"
+
+# Recovery is preview-only unless apply=1; uses the retained run manifest.
+janitor-gcp-live manifest apply="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PICCOLO_GCP_LIVE_PROJECT:?Set PICCOLO_GCP_LIVE_PROJECT to the approved project}"
+    args=()
+    case "{{ apply }}" in
+        0) ;;
+        1) args+=(--apply) ;;
+        *) echo "apply must be 0 or 1" >&2; exit 2 ;;
+    esac
+    PICCOLO_GCP_LIVE=1 \
+        uv run --locked python tests/gcp_janitor.py --manifest "{{ manifest }}" "${args[@]}"
+
+# Recover manifest-proven snapshots retained from the approved Piccolo session.
+purge-snapshots-gcp-live:
+    PICCOLO_GCP_LIVE=1 PYTHONPATH=tests uv run --locked python -m gcp_live_support.session purge-snapshots
+
+# Use the same approved baseline and monotonic start for all session actions.
+session-gcp-live action:
+    PICCOLO_GCP_LIVE=1 PYTHONPATH=tests uv run --locked python -m gcp_live_support.session "{{ action }}"
+
+coverage *args:
+    uv run --locked pytest --cov=src/piccolo --cov-report=term-missing {{args}}
+
+lint:
+    #!/usr/bin/env bash
+    set -u
+    status=0
+
+    uv run --locked ruff check {{check_dirs}} || status=1
+    uv run --locked ruff format --check {{check_dirs}} || status=1
+
+    exit "$status"
+
+lint-yaml:
+    #!/usr/bin/env bash
+    set -u
+    status=0
+
+    uv run --locked pre-commit run --all-files actionlint || status=1
+    uv run --locked pre-commit run --all-files check-yaml || status=1
+
+    exit "$status"
+
+lint-fix:
+    uv run --locked ruff format {{check_dirs}}
+    uv run --locked ruff check --fix {{check_dirs}}
+    uv run --locked ruff format {{check_dirs}}
+
+typecheck:
+    uv run --locked pyrefly check {{src_dir}} tests/gcp_live_support
+
+spell-diff:
+    uvx --from typos typos --diff
+
+ci: test lint typecheck
+
+build: lock-check
+    @echo "Building the project..."
+    rm -rf dist/
+    uv build --no-sources
+
+check-dist: build
+    uv run --locked twine check --strict dist/*
+
+# Local command checks without cloud credentials or API requests.
+smoke:
+    uv run --locked piccolo --help
+    uv run --locked piccolo validate --config examples/gcp/piccolo.toml
+
+# Verify the wheel works without the optional GCP SDK dependencies.
+package-smoke: build
+    uv run --isolated --no-project --with ./dist/piccolo_stack-*-py3-none-any.whl piccolo validate --config examples/gcp/piccolo.toml
+
+# Rotate the changelog locally before opening the release PR.
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CHANGELOG="CHANGELOG.md"
+    VERSION="{{ version }}"
+
+    if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9.-]*)$ ]]; then
+        echo "error: version must look like 1.2.3 or 1.2.3rc1" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$CHANGELOG" ]]; then
+        echo "error: $CHANGELOG is missing" >&2
+        exit 1
+    fi
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "error: working tree is dirty; commit or stash first" >&2
+        exit 1
+    fi
+
+    unreleased_count="$(awk '$0 == "## [Unreleased]" { count += 1 } END { print count + 0 }' "$CHANGELOG")"
+    if [[ "$unreleased_count" -ne 1 ]]; then
+        echo "error: expected exactly one '## [Unreleased]' heading, found $unreleased_count" >&2
+        exit 1
+    fi
+
+    if awk -v heading="## [$VERSION]" '
+        index($0, heading) == 1 &&
+          (length($0) == length(heading) ||
+           substr($0, length(heading) + 1, 2) == " -") {
+            found=1
+            exit
+        }
+        END { exit !found }
+    ' "$CHANGELOG"; then
+        echo "error: $CHANGELOG already has a [$VERSION] section" >&2
+        exit 1
+    fi
+
+    bullets="$(awk '
+        $0 == "## [Unreleased]" { inside=1; next }
+        inside && /^## \[/ { inside=0 }
+        inside && /^[[:space:]]*[-*] / { count += 1 }
+        END { print count + 0 }
+    ' "$CHANGELOG")"
+    if [[ "$bullets" -eq 0 ]]; then
+        echo "error: [Unreleased] has no bullet entries; write release notes first" >&2
+        exit 1
+    fi
+
+    today="$(date -u +%Y-%m-%d)"
+    tmp="$(mktemp "${CHANGELOG}.tmp.XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+
+    awk -v version="$VERSION" -v date="$today" '
+        $0 == "## [Unreleased]" {
+            print
+            print ""
+            print "## [" version "] - " date
+            next
+        }
+        { print }
+    ' "$CHANGELOG" > "$tmp"
+
+    target="## [$VERSION] - $today"
+    if ! awk -v target="$target" '$0 == target { found=1 } END { exit !found }' "$tmp"; then
+        echo "error: changelog rewrite failed validation; file untouched" >&2
+        exit 1
+    fi
+
+    mv "$tmp" "$CHANGELOG"
+    trap - EXIT
+
+    echo "Prepared $CHANGELOG for v$VERSION. Review and commit it, then merge the PR."
+    echo "After merging, tag the resulting main commit:"
+    echo "  git tag -a v$VERSION -m \"v$VERSION\""
+    echo "  git push origin v$VERSION"
+
+clean:
+    rm -rf dist/ build/ .pytest_cache/ .mypy_cache/ .ruff_cache/ .pyrefly/
+    find . -type d -name __pycache__ -prune -exec rm -rf {} +
+
+# Additional local helpers.
+
+install: install-dev
+
+format:
+    uv run --locked ruff format {{src_dir}}
+
+format-check:
+    uv run --locked ruff format --check {{src_dir}}
+
+pre-commit-install:
+    uv run --locked pre-commit install
+
+pre-commit:
+    uv run --locked pre-commit run --all-files

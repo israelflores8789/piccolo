@@ -1,0 +1,69 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+# Replace project, service account, identity, zones, and image for your project.
+schema_version = 1
+environment = "research-dev"
+provider = "gcp"
+
+[bootstrap]
+script = "./scripts/bootstrap.sh"
+remote_path = ".piccolo/bootstrap/setup.sh"
+execution_user = "researcher"
+timeout = 1800
+
+[gcp]
+project_id = "my-gcp-project"
+enable_apis = false
+operation_timeout = 600
+
+[gcp.auth]
+mode = "adc"
+# mode = "file"
+# credential_file = "./credentials.json"
+# impersonate_service_account = "provisioner@my-gcp-project.iam.gserviceaccount.com"
+
+[gcp.instance]
+name = "research-dev"
+machine_type = "n2-standard-4"
+service_account = "research-dev@my-gcp-project.iam.gserviceaccount.com"
+
+[gcp.placement]
+zones = ["us-west1-c", "us-west1-a", "us-east1-b"]
+snapshot_location = "us"
+
+[gcp.disk]
+size_gb = 30
+type = "pd-standard"
+image = "projects/debian-cloud/global/images/debian-13-trixie-v20260727"
+
+[gcp.network]
+name = "default"
+subnet = "default"
+external_ip = false
+# For custom VPCs, explicitly map every candidate region to an existing subnet.
+# subnets = { us-west1 = "research-west", us-east1 = "research-east" }
+
+[gcp.iap]
+firewall_name = "research-dev-iap"
+ports = [22, 8080]
+source_ranges = ["35.235.240.0/20"]
+
+[gcp.iam]
+create_service_account = false
+secrets = []
+project_roles = []
+
+[gcp.ssh]
+user = "researcher"
+via_iap = true
+require_passphrase = false
+expire-after = "24h"
+readiness_timeout = 300
+# account = "you@example.com"
+# impersonate_service_account = "connection@my-gcp-project.iam.gserviceaccount.com"
+# readiness_command = "test -f ~/project-ready"
+
+[gcp.tunnel]
+remote_port = 8080
+local_port = 8080

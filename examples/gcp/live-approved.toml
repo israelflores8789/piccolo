@@ -1,0 +1,57 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+# For live testing purposes, this profile is a template for approved values.
+# It is not intended to be used directly.
+# Copy to .test_runs/approved.toml and fill in approved values before opting in.
+# This profile contains no bootstrap; the runner generates only a marker script.
+
+schema_version = 1
+environment = "live-profile"
+provider = "gcp"
+
+[gcp]
+project_id = "<piccolo-project-id>"
+enable_apis = false
+operation_timeout = 600
+
+[gcp.auth]
+mode = "adc"
+# ADC may be the provisioner's key; optional impersonation requires another source.
+# impersonate_service_account = "REPLACE-provisioner@<piccolo-project-id>.iam.gserviceaccount.com"
+
+[gcp.instance]
+name = "live-profile"
+service_account = "REPLACE-vm@<piccolo-project-id>.iam.gserviceaccount.com"
+machine_type = "e2-small"
+
+[gcp.placement]
+zones = ["us-west1-a", "us-east1-b"]
+snapshot_location = "us"
+
+[gcp.disk]
+size_gb = 10
+type = "pd-standard"
+image = "projects/debian-cloud/global/images/REPLACE-pinned-image"
+
+[gcp.network]
+name = "default"
+subnet = "default"
+external_ip = false
+# subnets = { us-west1 = "approved-west", us-east1 = "approved-east" }
+
+[gcp.iam]
+create_service_account = false
+secrets = []
+project_roles = []
+
+[gcp.ssh]
+user = "REPLACE_posix_username"
+account = "REPLACE-human@example.com"
+via_iap = true
+require_passphrase = false
+expire-after = "24h"
+readiness_timeout = 300
+
+[gcp.tunnel]
+remote_port = 8080
+local_port = 18080

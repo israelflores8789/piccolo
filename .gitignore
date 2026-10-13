@@ -1,3 +1,15 @@
+# Copyright 2026 Israel Flores-Arbolay
+# SPDX-License-Identifier: Apache-2.0
+
+# Operator authentication files belong outside the repository.
+/.credentials/
+**/application_default_credentials.json
+**/*credentials*.json
+**/*service-account*.json
+**/*service_account*.json
+**/*.pem
+**/*.key
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -37,6 +49,9 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+.test_logs/
+.test_runs/
+/.env.gcp-live
 htmlcov/
 .tox/
 .nox/
@@ -218,3 +233,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Miscellaneous
+.code-graph/
