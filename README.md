@@ -39,6 +39,8 @@ just install-dev
 just ci
 ```
 
+Shared OpenSSH mechanics live in `piccolo.openssh`; GCP authorization, host-key retrieval, address selection, and IAP setup remain in the GCP provider. State-root paths belong to `piccolo.state.paths`, Cloud SDK paths to `piccolo.providers.gcp.paths`, and Windows process containment to `piccolo.win32process`. Run the provider-independent client tests with `just test tests/test_openssh.py`, provider session tests with `just test tests/test_native_ssh.py`, and native ACL checks with `just test tests/test_windows_storage.py`. Platform-specific cases skip on other operating systems; `just test-local` excludes both live suites.
+
 ### Native Windows
 
 Install the Windows OpenSSH Client optional feature, version 9.0 or newer, and the full Google Cloud CLI. Native Windows Python selects `ssh.exe`, `scp.exe`, and `ssh-keygen.exe` under the Windows system OpenSSH directory even when Git Bash tools appear first on PATH. Windows Terminal with Git Bash and PowerShell use the same native implementation. Python inside WSL uses the Linux implementation and Linux paths. Keep private state and keys on a local ACL-capable filesystem; network shares, junctions, reparse points, and multiply linked private files are refused.

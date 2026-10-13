@@ -15,8 +15,8 @@ from google.oauth2 import service_account
 from piccolo.config.models import GCP
 from piccolo.data import decode, text
 from piccolo.errors import PiccoloError
-from piccolo.paths import cloud_sdk_directory
 from piccolo.privacy import remember_secrets
+from piccolo.providers.gcp.paths import cloud_sdk_directory
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"

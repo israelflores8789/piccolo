@@ -104,7 +104,7 @@ def local_preflight(config: Config | None = None) -> None:
     if os.name == "nt" and config is not None:
         from piccolo.providers.gcp.connection import GCloudConnection
 
-        GCloudConnection(config.gcp).ssh.executable("ssh")
+        GCloudConnection(config.gcp).ssh.client.executable("ssh")
 
 
 def run_config(

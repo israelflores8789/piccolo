@@ -41,7 +41,7 @@ def managed_process(
     )
     try:
         if sys.platform == "win32":
-            from piccolo.windows_process import process_job
+            from piccolo.win32process import process_job
 
             with process_job(process.pid):
                 yield process

@@ -1,7 +1,7 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 
-"""windows_process.py — Assign suspended children to jobs before allowing execution."""
+"""win32process.py — Assign suspended children to jobs before allowing execution."""
 
 import ctypes
 import sys

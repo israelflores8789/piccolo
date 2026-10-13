@@ -250,7 +250,7 @@ class SSHExpiryProbe:
         private_directory(directory)
         key = directory / "key"
         keygen = (
-            provider.connection.ssh.executable("ssh-keygen")
+            provider.connection.ssh.client.executable("ssh-keygen")
             if isinstance(provider.connection, GCloudConnection)
             and provider.connection.windows
             else "ssh-keygen"
@@ -346,7 +346,9 @@ class SSHExpiryProbe:
         if self.connection.windows:
             proxy = self.connection.ssh.proxy_command(self.zone)
         return [
-            self.connection.ssh.executable("ssh") if self.connection.windows else "ssh",
+            self.connection.ssh.client.executable("ssh")
+            if self.connection.windows
+            else "ssh",
             "-F",
             str(self.connection.empty_config)
             if self.connection.windows

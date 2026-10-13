@@ -11,8 +11,8 @@ from pathlib import Path
 from piccolo.config.models import Config
 from piccolo.data import Document, Value, decode, document, text
 from piccolo.errors import PiccoloError
-from piccolo.paths import state_root
 from piccolo.privacy import sanitize
+from piccolo.state.paths import state_root
 from piccolo.state.storage import private_directory, private_file, temporary_file
 
 

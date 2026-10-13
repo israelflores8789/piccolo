@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Changed
 
+- Separate provider-neutral OpenSSH key, trust-file, command, and transfer mechanics from GCP authorization and session preparation; split state and Cloud SDK path ownership and rename the Win32 process helper.
+- Run shared OpenSSH regression tests independently of GCP, with actual local key preparation on each supported platform and separately selectable Windows-specific checks.
 - Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.
 - Centralize Cloud SDK configuration paths and prefer the Windows SDK's bundled interpreter when present; retain separate SDK and connection identities.
 - Extract shared GCP SSH behavior behind one transport interface and add `just test-local` with explicit live-test exclusions.

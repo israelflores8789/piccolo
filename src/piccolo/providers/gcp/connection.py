@@ -16,8 +16,8 @@ from piccolo.config.models import GCP
 from piccolo.data import Document, decode, document
 from piccolo.errors import PiccoloError
 from piccolo.logger import log
-from piccolo.paths import cloud_sdk_directory
 from piccolo.process import run_command
+from piccolo.providers.gcp.paths import cloud_sdk_directory
 from piccolo.providers.gcp.ssh import SSHTransport
 from piccolo.state.storage import (
     PrivateTemporaryDirectory,
