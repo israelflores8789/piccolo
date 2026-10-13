@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-13
+
 ### Added
 
 - Strict TOML configuration discovery and validation, a Typer CLI, and an optional Google Cloud SDK provider.
