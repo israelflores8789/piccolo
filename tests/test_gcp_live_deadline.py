@@ -89,7 +89,17 @@ def test_gcloud_config_inspection_obeys_remaining_deadline(
         assert invoke.call_count == 1
 
 
-@pytest.mark.parametrize("anchor", ["nan", "inf", "-1", "invalid"])
+def test_live_process_accepts_negative_monotonic_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept finite anchors below zero because monotonic origins are arbitrary."""
+    started = -200.0
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_STARTED_MONOTONIC", str(started))
+    with live_session() as deadline:
+        assert deadline.started == started
+
+
+@pytest.mark.parametrize("anchor", ["nan", "inf", "-inf", "1e300", "invalid"])
 def test_live_process_rejects_invalid_session_start(
     monkeypatch: pytest.MonkeyPatch,
     anchor: str,

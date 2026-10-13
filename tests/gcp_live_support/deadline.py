@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import time
@@ -225,7 +226,7 @@ def live_session() -> Generator[Deadline]:
             raise PiccoloError(
                 "Live-session start must be a monotonic timestamp"
             ) from exc
-        if not 0 <= started <= deadline.started:
+        if not math.isfinite(started) or started > deadline.started:
             raise PiccoloError(
                 "Live-session start must be finite and not in the future"
             )
