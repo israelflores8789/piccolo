@@ -191,7 +191,7 @@ jobs:
       id-token: write # OIDC trusted publishing — no API token
     steps:
     - name: Download distributions
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: dist
         path: dist/
@@ -219,13 +219,13 @@ jobs:
       attestations: write
     steps:
     - name: Download distributions
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: dist
         path: dist/
 
     - name: Download release notes
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         name: release-notes
         path: .
