@@ -38,7 +38,7 @@ jobs:
         enable-cache: true
 
     - name: Install development dependencies
-      run: uv sync --locked --all-groups
+      run: uv sync --locked --all-groups --extra gcp
 
     - name: Run unit tests
       uses: pavelzw/pytest-action@v2
@@ -83,7 +83,7 @@ jobs:
       uses: extractions/setup-just@v4
 
     - name: Install development dependencies
-      run: uv sync --locked --all-groups
+      run: uv sync --locked --all-groups --extra gcp
 
     - name: Check formatting and lint
       run: just lint
