@@ -487,7 +487,9 @@ class Access:
             return ""
 
         def submit() -> str:
-            for attempt in range(3):
+            deadline = time.monotonic() + 60
+            conflicts = 0
+            while True:
                 policy = read()
                 if not policy.etag:
                     raise PiccoloError(
@@ -525,16 +527,58 @@ class Access:
                         self.clients.principal, policy_role, resource
                     ) from exc
                 except (exceptions.Aborted, exceptions.Conflict):
-                    if attempt == 2:
+                    conflicts += 1
+                    if conflicts == 3:
                         raise
-                    time.sleep(0.25 * 2**attempt)
-            return ""
+                    time.sleep(0.25 * 2 ** (conflicts - 1))
+                except exceptions.InvalidArgument as exc:
+                    if time.monotonic() >= deadline or not self.account_propagating(
+                        exc
+                    ):
+                        raise
+                    time.sleep(min(2, max(0, deadline - time.monotonic())))
 
         self.mutation(
             f"iam:{resource}:{role}:{member}",
             submit,
             observe,
             recover=lambda _: submit(),
+        )
+
+    def account_propagating(self, error: exceptions.InvalidArgument) -> bool:
+        """Retry a rejected grant only for the journaled newly created identity."""
+        account = self.gcp.service_account
+        if (
+            not self.gcp.create_service_account
+            or f"service account {account} does not exist" not in str(error).lower()
+            or self.journal is None
+        ):
+            return False
+        action = next(
+            (
+                a
+                for a in objects(self.journal.operation, "access_actions")
+                if text(a, "key") == f"service-account:{account}"
+            ),
+            None,
+        )
+        if (
+            action is None
+            or action.get("preexisting") is not False
+            or text(action, "status") != "done"
+            or not text(action, "resource_id")
+        ):
+            return False
+        try:
+            observed = self.clients.iam.get_service_account(
+                name=f"projects/{self.gcp.project_id}/serviceAccounts/{account}",
+                retry=READ_RETRY,
+                timeout=30,
+            )
+        except exceptions.NotFound:
+            return False
+        return (
+            observed.unique_id == text(action, "resource_id") and not observed.disabled
         )
 
     def mutation(

@@ -29,6 +29,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Remediate 2026-10-11 security audit findings H01-H06 with local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions.
+- Remediate 2026-10-11 security audit findings M01–M08 with guest IAM safeguards, immutable creation and recovery identities, strict relocation settings, and private verified bootstrap uploads and runners.
+- Remediate 2026-10-11 security audit findings M09–M12 and L01–L02 with bootstrap interruption guards, credential redaction, explicit recovery-copy finalization, canonical settings fingerprints, corrected live instructions, and runtime-only wheel contents.
+- Inspect the pinned Compute SDK's `firewall_policys` response field so inherited non-IAP ingress remains blocked.
+- Wait for a proven newly created service account to become visible to IAM grant APIs, preserving its recorded identity and rereading policies after rejected grants.
+- Allow bounded SCP reconnection after an expiring OS Login key is renewed but its authorization has not yet propagated; preserve errors for other transfer failures.
+- Share a persisted live-session start across setup, selections, reruns, and cleanup, bind approved duration extensions into the review digest, and retain separate selection logs.
+- Journal synthetic capacity failures before live fallback recovery and distinguish stale deleted-account listings from replacement identities during scoped cleanup.
 - Accept output-only Compute VM and disk resource status during relocation without copying it into replacement requests.
 - Omit source integrity-baseline update actions from replacement creation while preserving Shielded VM settings.
 - Preserve approved guest project roles in live tests and remove only test-added IAM members during teardown.
@@ -36,11 +44,6 @@ All notable changes to this project will be documented in this file. The format 
 - Preserve public secret resource and IAM binding identifiers during credential redaction so independent cleanup can reopen live manifests.
 - Wait for authenticated guest host-key publication before starting SSH expiration observations.
 - Permanently purge manifest-proven test snapshots from the GCP recycle bin, include recoverable copies in residual inventories, and retain uncertain purge requests without resubmission.
-
-- Remediate 2026-10-11 security audit findings H01-H06 with local security regressions and gated live credential, fallback recovery, state-loss cleanup, ownership, and shutdown metadata regressions.
-- Remediate 2026-10-11 security audit findings M01–M08 with guest IAM safeguards, immutable creation and recovery identities, strict relocation settings, and private verified bootstrap uploads and runners.
-- Remediate 2026-10-11 security audit findings M09–M12 and L01–L02 with bootstrap interruption guards, credential redaction, explicit recovery-copy finalization, canonical settings fingerprints, corrected live instructions, and runtime-only wheel contents.
-- Inspect the pinned Compute SDK's `firewall_policys` response field so inherited non-IAP ingress remains blocked.
 
 - Reject inherited and persisted gcloud authentication overrides on all connection paths, including receipt reads and live tunnels.
 - Validate supported SDK credential JSON before type-specific loading, including environment and well-known ADC files.

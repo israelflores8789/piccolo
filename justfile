@@ -34,10 +34,11 @@ test-gcp-live config test-name="tests/test_gcp_live.py" *args:
     config="$1"
     test_name="$2"
     shift 2
-    uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(".test_logs/pytest-gcp-live.log"), create=True))'
+    log_file="${PICCOLO_GCP_LIVE_LOG:-.test_logs/pytest-gcp-live.log}"
+    PICCOLO_GCP_LIVE_LOG="$log_file" uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(os.environ["PICCOLO_GCP_LIVE_LOG"]), create=True))'
     PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="$config" \
         {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "$test_name" "$@" < /dev/null \
-        2>&1 | tee .test_logs/pytest-gcp-live.log
+        2>&1 | tee "$log_file"
 
 # Recovery is preview-only unless apply=1; uses the retained run manifest.
 janitor-gcp-live manifest apply="0":
@@ -56,6 +57,10 @@ janitor-gcp-live manifest apply="0":
 # Recover manifest-proven snapshots retained from the approved Piccolo session.
 purge-snapshots-gcp-live:
     PICCOLO_GCP_LIVE=1 PYTHONPATH=tests uv run --locked python -m gcp_live_support.session purge-snapshots
+
+# Use the same approved baseline and monotonic start for all session actions.
+session-gcp-live action:
+    PICCOLO_GCP_LIVE=1 PYTHONPATH=tests uv run --locked python -m gcp_live_support.session "{{ action }}"
 
 coverage *args:
     uv run --locked pytest --cov=src/piccolo --cov-report=term-missing {{args}}

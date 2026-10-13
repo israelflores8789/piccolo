@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from piccolo.providers.gcp.connection import GCloudConnection
 
 TOTAL_SECONDS = 45 * 60
+MAX_SECONDS = 105 * 60
 CLEANUP_SECONDS = 5 * 60
 INVENTORY_SECONDS = 60
 SERVICE_USAGE_INTERVAL = 1.05
@@ -43,9 +44,9 @@ class Deadline:
     ) -> None:
         """Reserve the final five minutes, including one minute for inventory."""
         self.clock = clock
-        if not CLEANUP_SECONDS < total_seconds <= TOTAL_SECONDS:
+        if not CLEANUP_SECONDS < total_seconds <= MAX_SECONDS:
             raise PiccoloError(
-                "Live duration must exceed cleanup reserve and be at most 2700 seconds"
+                "Live duration must exceed cleanup reserve and be at most 6300 seconds"
             )
         self.total_seconds = total_seconds
         self.started = clock()
@@ -215,15 +216,23 @@ def live_session() -> Generator[Deadline]:
         return
     from piccolo.providers.gcp.connection import GCloudConnection
 
-    try:
-        total_seconds = int(
-            os.environ.get("PICCOLO_GCP_LIVE_SECONDS", str(TOTAL_SECONDS))
-        )
-    except ValueError as exc:
-        raise PiccoloError("PICCOLO_GCP_LIVE_SECONDS must be an integer") from exc
-    deadline = Deadline(total_seconds=total_seconds)
+    deadline = Deadline(total_seconds=duration_seconds())
+    anchor = os.environ.get("PICCOLO_GCP_LIVE_STARTED_MONOTONIC")
+    if anchor is not None:
+        try:
+            started = float(anchor)
+        except ValueError as exc:
+            raise PiccoloError(
+                "Live-session start must be a monotonic timestamp"
+            ) from exc
+        if not 0 <= started <= deadline.started:
+            raise PiccoloError(
+                "Live-session start must be finite and not in the future"
+            )
+        deadline.started = started
     token = ACTIVE.set(deadline)
     original_run = GCloudConnection.run
+    original_invoke = GCloudConnection.invoke
 
     def bounded_run(
         self: GCloudConnection,
@@ -241,8 +250,47 @@ def live_session() -> Generator[Deadline]:
             raise PiccoloError("Live transport deadline expired")
         return original_run(self, arguments, timeout=int(seconds), capture=capture)
 
+    def bounded_invoke(
+        self: GCloudConnection,
+        arguments: list[str],
+        environment: dict[str, str],
+        *,
+        timeout: int | None = 60,
+        capture: bool = True,
+        use_flags: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Include config inspection and recompute after nested identity checks."""
+        current = ACTIVE.get()
+        seconds = min(30.0, float(timeout) if timeout is not None else 30.0)
+        if current is not None:
+            seconds = min(seconds, current.remaining())
+        if seconds < 1:
+            raise PiccoloError("Live transport deadline expired")
+        return original_invoke(
+            self,
+            arguments,
+            environment,
+            timeout=int(seconds),
+            capture=capture,
+            use_flags=use_flags,
+        )
+
     try:
-        with patch.object(GCloudConnection, "run", bounded_run):
+        with (
+            patch.object(GCloudConnection, "run", bounded_run),
+            patch.object(GCloudConnection, "invoke", bounded_invoke),
+        ):
             yield deadline
     finally:
         ACTIVE.reset(token)
+
+
+def duration_seconds() -> int:
+    """Read the explicitly approved duration shared by review and execution."""
+    try:
+        seconds = int(os.environ.get("PICCOLO_GCP_LIVE_SECONDS", str(TOTAL_SECONDS)))
+    except ValueError as exc:
+        raise PiccoloError("PICCOLO_GCP_LIVE_SECONDS must be an integer") from exc
+    if not CLEANUP_SECONDS < seconds <= MAX_SECONDS:
+        raise PiccoloError("Live duration must be between 301 and 6300 seconds")
+    return seconds

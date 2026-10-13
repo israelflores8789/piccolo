@@ -50,6 +50,93 @@ RUN = "plive-0123456789abcdef"
 ZONE = "us-west1-a"
 
 
+def test_transfer_budget_persists_reservations_and_blocks_excess(
+    approved: Config,
+    manifest: Manifest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Charge retries once and reject excess transfers before SDK submission."""
+    path = tmp_path / "budget.json"
+    path.write_text(
+        json.dumps(
+            {
+                "reserved_micro_usd": 100_000,
+                "limit_micro_usd": 140_000,
+                "reservations": {},
+            }
+        )
+    )
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_BUDGET_FILE", str(path))
+    config = replace(
+        approved,
+        gcp=replace(
+            approved.gcp,
+            machine_type="e2-small",
+            size_gb=10,
+            external_ip=False,
+            snapshot_location="us-west1",
+        ),
+    )
+    cloud = LiveCloud(config, Clients(AnonymousCredentials()), manifest)
+    monkeypatch.setattr(cloud, "get", Mock(return_value={"storage_bytes": str(2**30)}))
+    monkeypatch.setattr(cloud, "owns", Mock(return_value=True))
+    manifest.register("snapshot", f"{RUN}-snapshot", "", {})
+    resource: Document = {
+        "source_snapshot": f"projects/{TEST_PROJECT}/global/snapshots/{RUN}-snapshot"
+    }
+    cloud.reserve_transfer("disk.insert", "us-east1-b", resource, "request-one")
+    cloud.reserve_transfer("disk.insert", "us-east1-b", resource, "request-one")
+    assert json.loads(path.read_text())["reserved_micro_usd"] == 120_000
+    cloud.reserve_transfer("disk.insert", "us-east1-b", resource, "request-two")
+    with pytest.raises(PiccoloError, match="cannot fund"):
+        cloud.reserve_transfer("disk.insert", "us-east1-b", resource, "request-three")
+    monkeypatch.setattr(
+        cloud, "get", Mock(return_value={"storage_bytes": str(2**30 + 1)})
+    )
+    with pytest.raises(PiccoloError, match="one GiB"):
+        cloud.reserve_transfer("disk.insert", "us-east1-b", resource, "oversized")
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_account_list_after_confirmed_deletion_preserves_replacements(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: bool,
+) -> None:
+    """Do not resurrect a deleted ID from a stale list or hide a new identity."""
+    name = approved.gcp.service_account
+    entry = manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
+    entry["id"] = "original"
+    manifest.put("resources", entry)
+    action = manifest.intent("account.delete", name, "")
+    action["settled"] = True
+    manifest.put("actions", action)
+    clients = Clients(AnonymousCredentials())
+    monkeypatch.setattr(
+        clients.iam,
+        "get_service_account",
+        Mock(side_effect=exceptions.NotFound("deleted")),
+    )
+    monkeypatch.setattr(
+        clients.iam,
+        "list_service_accounts",
+        Mock(
+            return_value=[
+                iam_admin_v1.ServiceAccount(
+                    email=name, unique_id="replacement" if replacement else "original"
+                )
+            ]
+        ),
+    )
+    observed = LiveCloud(approved, clients, manifest).get("account", name)
+    if replacement:
+        assert observed is not None and observed["id"] == "replacement"
+    else:
+        assert observed is None
+
+
 @pytest.fixture
 def approved(monkeypatch: pytest.MonkeyPatch, config: Config) -> Config:
     monkeypatch.setenv("PICCOLO_GCP_LIVE", "1")
@@ -1016,7 +1103,9 @@ def test_sync_account_visibility_is_reconciled_with_reads_only(
     manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
     observed: Document = {"id": "immutable", "displayName": f"Piccolo {RUN}"}
     cloud = LiveCloud(approved, Clients(AnonymousCredentials()), manifest)
-    getter = Mock(side_effect=[None, observed, observed, None])
+    getter = Mock(
+        side_effect=[None, observed, observed, None, observed, None, None, None]
+    )
     monkeypatch.setattr(cloud, "get", getter)
     wait = Mock()
     monkeypatch.setattr("gcp_live_support.gcp_sdk.time.sleep", wait)
@@ -1024,8 +1113,101 @@ def test_sync_account_visibility_is_reconciled_with_reads_only(
     assert cloud.settle(create)
     delete = manifest.intent("account.delete", name, "")
     assert cloud.settle(delete)
+    assert getter.call_count == 8
+    assert wait.call_count == 6
+
+
+def test_confirmed_account_delete_rechecks_visibility_without_resubmission(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile a stale positive read after deletion using only repeated reads."""
+    name = approved.gcp.service_account
+    entry = manifest.register("account", name, "", {"displayName": f"Piccolo {RUN}"})
+    entry["id"] = "original"
+    manifest.put("resources", entry)
+    action = manifest.intent("account.delete", name, "")
+    action["settled"] = True
+    manifest.put("actions", action)
+    clients = Clients(AnonymousCredentials())
+    deleter = Mock()
+    monkeypatch.setattr(clients.iam, "delete_service_account", deleter)
+    cloud = LiveCloud(approved, clients, manifest)
+    getter = Mock(side_effect=[{"id": "original"}, None, None, None])
+    monkeypatch.setattr(cloud, "get", getter)
+    monkeypatch.setattr(cloud, "owns", Mock(return_value=True))
+    monkeypatch.setattr("gcp_live_support.gcp_sdk.time.sleep", Mock())
+    cloud.delete(entry)
+    deleter.assert_not_called()
     assert getter.call_count == 4
-    assert wait.call_count == 2
+
+
+def test_finalizer_detects_live_worker_without_access_to_its_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sandbox-hidden cwd must not make an active fixture appear finished."""
+    from gcp_live_support import session
+
+    worker = tmp_path / "123"
+    worker.mkdir()
+    executable = Path(session.__file__).resolve().parents[2] / ".venv/bin/pytest"
+    (worker / "cmdline").write_bytes(
+        b"python\0" + str(executable).encode() + b"\0--gcp-live\0"
+    )
+    monkeypatch.setattr(Path, "iterdir", lambda _path: iter([worker]))
+    assert session.live_workers() == [123]
+
+
+def test_iam_conflict_rereads_policy_and_preserves_concurrent_members(
+    approved: Config,
+    manifest: Manifest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry a rejected etag transaction using a fresh policy, preserving new grants."""
+    role = "roles/compute.viewer"
+    approved = replace(approved, gcp=replace(approved.gcp, project_roles=(role,)))
+    clients = Clients(AnonymousCredentials())
+    monkeypatch.setattr(
+        clients.projects,
+        "get_project",
+        Mock(
+            return_value=resourcemanager_v3.Project(
+                name="projects/123", project_id=TEST_PROJECT
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        clients.iam,
+        "get_service_account",
+        Mock(return_value=iam_admin_v1.ServiceAccount(unique_id="original-guest")),
+    )
+    first = policy_pb2.Policy(version=3, etag=b"first")
+    first.bindings.add(role=role, members=["user:original@example.com"])
+    second = policy_pb2.Policy(version=3, etag=b"second")
+    second.bindings.add(
+        role=role, members=["user:original@example.com", "user:concurrent@example.com"]
+    )
+    monkeypatch.setattr(
+        clients.projects, "get_iam_policy", Mock(side_effect=[first, second])
+    )
+    setter = Mock(side_effect=[exceptions.Aborted("etag conflict"), None])
+    monkeypatch.setattr(clients.projects, "set_iam_policy", setter)
+    monkeypatch.setattr("gcp_live_support.gcp_sdk.time.sleep", Mock())
+    cloud = LiveCloud(approved, clients, manifest)
+    cloud.binding(
+        "project", TEST_PROJECT, role, f"serviceAccount:{approved.gcp.service_account}"
+    )
+    written = setter.call_args.kwargs["request"].policy
+    assert written.etag == b"second"
+    assert set(written.bindings[0].members) == {
+        "user:original@example.com",
+        "user:concurrent@example.com",
+        f"serviceAccount:{approved.gcp.service_account}",
+    }
+    assert setter.call_count == 2
+    assert len(manifest.entries("bindings")) == 1
 
 
 def test_definitively_rejected_create_allows_zero_leftover_cleanup(

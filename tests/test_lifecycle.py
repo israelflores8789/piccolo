@@ -46,6 +46,38 @@ def test_capacity_fallback_only_after_terminal_failure(
     assert len(cloud.list("disk")) == 2
 
 
+def test_synthetic_disk_capacity_failure_is_durable_before_later_acceptance(
+    config: Config,
+    cloud: FakeCloud,
+    connection: GuestConnection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-submission failure must be journaled so recovery skips that zone."""
+    original = cloud.submit
+
+    def submit(
+        kind: str, name: str, zone: str, resource: Document, request_id: str
+    ) -> str:
+        if kind == "disk.insert" and zone == "us-west1-a":
+            raise CapacityError("Synthetic capacity failure without a cloud request")
+        return original(kind, name, zone, resource, request_id)
+
+    monkeypatch.setattr(cloud, "submit", submit)
+    cloud.lost_response.add(("instance.insert", "us-east1-b"))
+    provider = GCPProvider(config, cloud, connection)
+    with pytest.raises(UncertainError):
+        provider.init()
+    assert any(
+        a.get("capacity") is True and a.get("status") == "failed"
+        for a in objects(provider.journal.operation, "actions")
+    )
+    monkeypatch.setattr(cloud, "submit", original)
+    recovered = GCPProvider(config, cloud, connection)
+    recovered.resume()
+    assert zone_of(recovered.active()) == "us-east1-b"
+    assert all(call[2] != "us-west1-a" for call in cloud.calls)
+
+
 @pytest.mark.parametrize(
     "code",
     [

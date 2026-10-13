@@ -4,6 +4,7 @@
 """test_gcp_live_deadline.py — Offline deadline, inventory, and approval checks."""
 
 import subprocess
+import time
 from collections.abc import Generator
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +35,69 @@ from piccolo.data import document, objects
 from piccolo.errors import PiccoloError
 from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.connection import GCloudConnection
+
+
+def test_restarted_live_process_preserves_session_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Include prior setup and reruns in the remaining phase allowance."""
+    started = time.monotonic() - 200
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_STARTED_MONOTONIC", str(started))
+    with live_session() as first:
+        assert first.started == started
+        remaining = first.remaining()
+    with live_session() as second:
+        assert second.started == started
+        assert second.remaining() <= remaining
+        assert second.remaining() < TOTAL_SECONDS - CLEANUP_SECONDS - 200
+
+
+def test_explicit_duration_extension_preserves_anchor_and_changes_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+) -> None:
+    """Bind a reviewed extension to the same start and a new approval digest."""
+    original = approval_digest(config)
+    started = time.monotonic() - 200
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_STARTED_MONOTONIC", str(started))
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", "3600")
+    assert approval_digest(config) != original
+    with live_session() as deadline:
+        assert deadline.started == started
+        assert deadline.total_seconds == 3600
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", "6301")
+    with pytest.raises(PiccoloError, match="duration"):
+        approval_digest(config)
+
+
+def test_gcloud_config_inspection_obeys_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Config,
+) -> None:
+    """Bound direct invocation used before a connection command is constructed."""
+    invoke = Mock(return_value=subprocess.CompletedProcess([], 0, "{}", ""))
+    monkeypatch.setattr(GCloudConnection, "invoke", invoke)
+    with live_session() as deadline:
+        now = [deadline.started + TOTAL_SECONDS - CLEANUP_SECONDS - 3]
+        deadline.clock = lambda: now[0]
+        connection = GCloudConnection(config.gcp)
+        connection.invoke(["config", "list"], {}, use_flags=False)
+        assert invoke.call_args.kwargs["timeout"] == 3
+        now[0] += 3
+        with pytest.raises(PiccoloError, match="work deadline"):
+            connection.invoke(["config", "list"], {}, use_flags=False)
+        assert invoke.call_count == 1
+
+
+@pytest.mark.parametrize("anchor", ["nan", "inf", "-1", "invalid"])
+def test_live_process_rejects_invalid_session_start(
+    monkeypatch: pytest.MonkeyPatch,
+    anchor: str,
+) -> None:
+    """Reject anchors that disable the deadline or refer to another clock."""
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_STARTED_MONOTONIC", anchor)
+    with pytest.raises(PiccoloError, match="start must be"), live_session():
+        pytest.fail("Invalid start was accepted")
 
 
 @pytest.fixture
@@ -282,7 +346,7 @@ def test_shorter_live_session_preserves_cleanup_reserve(
             assert deadline.remaining() == pytest.approx(400)
 
 
-@pytest.mark.parametrize("duration", ["0", "300", "2701", "-1", "invalid"])
+@pytest.mark.parametrize("duration", ["0", "300", "6301", "-1", "invalid"])
 def test_live_session_rejects_invalid_or_extended_duration(
     monkeypatch: pytest.MonkeyPatch, duration: str
 ) -> None:

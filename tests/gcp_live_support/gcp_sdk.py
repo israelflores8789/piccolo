@@ -8,6 +8,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import override
 
 from google.api_core import exceptions
@@ -25,6 +26,7 @@ from piccolo.providers.gcp.operations import failure
 from piccolo.providers.gcp.provider import GCPProvider
 from piccolo.providers.gcp.provision import labels
 from piccolo.providers.gcp.resources import READ_RETRY, SDKCloud
+from piccolo.state.storage import private_file
 
 
 class LiveCloud(SDKCloud):
@@ -53,7 +55,7 @@ class LiveCloud(SDKCloud):
         bind_clients(clients)
         self.manifest = manifest
         self.provisioner = provisioner or config.gcp.auth.impersonate_service_account
-        self.ssh_login_mode = "oslogin"
+        self.ssh_login_mode = os.environ.get("PICCOLO_GCP_LIVE_LOGIN_MODE", "oslogin")
 
     @override
     def get(self, kind: str, name: str, zone: str = "") -> Document | None:
@@ -112,6 +114,16 @@ class LiveCloud(SDKCloud):
                 name=f"projects/{self.project}", retry=READ_RETRY, timeout=30
             ):
                 if account.email == name:
+                    deleted = any(
+                        text(action, "kind") == "account.delete"
+                        and text(action, "name") == name
+                        and action.get("settled") is True
+                        and not text(action, "error")
+                        for action in self.manifest.entries("actions")
+                    )
+                    if deleted and account.unique_id == text(entry, "id"):
+                        # A stale list must not resurrect an authoritatively absent ID.
+                        return None
                     result = decode(iam_admin_v1.ServiceAccount.to_json(account))
                     result["id"] = account.unique_id
                     break
@@ -326,6 +338,8 @@ class LiveCloud(SDKCloud):
         items = objects(metadata, "items")
         if self.ssh_login_mode not in {"oslogin", "metadata"}:
             raise PiccoloError("Unsupported live SSH login mode")
+        self.manifest.data["ssh_login_mode"] = self.ssh_login_mode
+        self.manifest.save()
         if not any(text(item, "key") == "enable-oslogin" for item in items):
             items.append(
                 {
@@ -348,6 +362,7 @@ class LiveCloud(SDKCloud):
         """Gate and journal every Compute mutation, including lifecycle operations."""
         gate(self.project)
         check_work()
+        self.reserve_transfer(kind, zone, resource, request_id)
         resource_kind, verb = kind.split(".")
         if verb == "insert":
             if resource_kind == "instance":
@@ -390,6 +405,78 @@ class LiveCloud(SDKCloud):
         self.manifest.put("actions", action)
         return operation
 
+    def reserve_transfer(
+        self, kind: str, zone: str, resource: Document, request_id: str
+    ) -> None:
+        """Persist conservative transfer charges before an approved session request."""
+        path = os.environ.get("PICCOLO_GCP_LIVE_BUDGET_FILE")
+        if not path or kind not in {
+            "snapshot.insert",
+            "disk.insert",
+            "instance.insert",
+        }:
+            return
+        if (
+            self.config.gcp.machine_type != "e2-small"
+            or self.config.gcp.size_gb > 10
+            or self.config.gcp.external_ip
+            or self.config.gcp.snapshot_location != "us-west1"
+        ):
+            raise PiccoloError("Session budget requires the reviewed regional profile")
+        charge = 0
+        if kind == "snapshot.insert":
+            source = text(resource, "source_disk")
+            source_zone = source.split("/zones/")[-1].split("/")[0]
+            if source_zone.rsplit("-", 1)[0] != "us-west1":
+                # Reserve transfer of the entire approved 10 GiB disk.
+                charge = 200_000
+        elif kind == "disk.insert" and text(resource, "source_snapshot"):
+            snapshot_name = text(resource, "source_snapshot").rsplit("/", 1)[-1]
+            entry = self.manifest.lookup("snapshot", snapshot_name)
+            snapshot = self.get("snapshot", snapshot_name)
+            if entry is None or snapshot is None or not self.owns(entry, snapshot):
+                raise PiccoloError("Budget snapshot identity is unproven")
+            stored = snapshot.get("storage_bytes")
+            if not isinstance(stored, int | str) or not str(stored).isdecimal():
+                raise PiccoloError("Snapshot transfer size is unavailable")
+            if not 0 < int(stored) <= 2**30:
+                raise PiccoloError("Snapshot exceeds the one GiB transfer allowance")
+            if zone.rsplit("-", 1)[0] != "us-west1":
+                charge = 20_000
+        if not charge:
+            return
+        import fcntl
+
+        with os.fdopen(private_file(Path(path)), "r+") as stream:
+            while True:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(timeout(0.1))
+            ledger = decode(stream.read())
+            reservations = document(ledger["reservations"])
+            if request_id in reservations:
+                return
+            spent = ledger["reserved_micro_usd"]
+            limit = ledger["limit_micro_usd"]
+            if (
+                not isinstance(spent, int)
+                or not isinstance(limit, int)
+                or limit > 800_000
+            ):
+                raise PiccoloError("Invalid approved session budget")
+            if spent + charge > limit:
+                raise PiccoloError("Cumulative live budget cannot fund this transfer")
+            reservations[request_id] = charge
+            ledger["reservations"] = reservations
+            ledger["reserved_micro_usd"] = spent + charge
+            stream.seek(0)
+            json.dump(ledger, stream, indent=2)
+            stream.flush()
+            stream.truncate()
+            os.fsync(stream.fileno())
+
     @override
     def poll(self, name: str, zone: str) -> Document:
         """Persist terminal outcomes and creation IDs before operations expire."""
@@ -427,11 +514,16 @@ class LiveCloud(SDKCloud):
         }:
             resource_kind, verb = kind.split(".")
             deadline = time.monotonic() + self.config.gcp.operation_timeout
+            absent_reads = 0
             while True:
                 check_work()
                 observed = self.get(resource_kind, name)
                 if verb == "delete" and observed is None:
-                    break
+                    absent_reads += 1
+                    if resource_kind != "account" or absent_reads >= 3:
+                        break
+                else:
+                    absent_reads = 0
                 if verb == "create" and observed is not None:
                     entry = self.manifest.lookup(resource_kind, name)
                     if entry is None or not self.owns(entry, observed):
@@ -531,6 +623,8 @@ class LiveCloud(SDKCloud):
             if not all(a.get("settled") is True for a in previous):
                 raise PiccoloError("Previous deletion remains uncertain")
             if not text(previous[-1], "error"):
+                if kind == "account" and self.settle(previous[-1]):
+                    return
                 raise PiccoloError(
                     "Completed deletion still has a resource; inspect it"
                 )
@@ -634,6 +728,26 @@ class LiveCloud(SDKCloud):
             self.clients.secrets.set_iam_policy(request=request, retry=None, timeout=30)
 
     def binding(self, kind: str, name: str, role: str, member: str) -> None:
+        """Re-read and merge grants after definitively rejected IAM conflicts."""
+        deadline = time.monotonic() + 60
+        conflicts = 0
+        while True:
+            try:
+                self._binding_once(kind, name, role, member)
+                return
+            except (exceptions.Aborted, exceptions.Conflict):
+                conflicts += 1
+                if conflicts == 3:
+                    raise
+                time.sleep(timeout(2 ** (conflicts - 1)))
+            except exceptions.InvalidArgument as exc:
+                if time.monotonic() >= deadline or not LiveAccess(
+                    self
+                ).account_propagating(exc):
+                    raise
+                time.sleep(timeout(min(2, max(0, deadline - time.monotonic()))))
+
+    def _binding_once(self, kind: str, name: str, role: str, member: str) -> None:
         """Record only a missing grant on a proven fixture-owned policy target."""
         gate(self.project)
         if kind == "project":
@@ -680,6 +794,19 @@ class LiveCloud(SDKCloud):
             "absent_before": True,
             "guest_id": guest_id,
         }
+        previous = next(
+            (
+                item
+                for item in self.manifest.entries("bindings")
+                if text(item, "key") == text(binding, "key")
+            ),
+            None,
+        )
+        if previous is not None and (
+            text(previous, "target_id") != text(binding, "target_id")
+            or text(previous, "guest_id") != guest_id
+        ):
+            raise PiccoloError("IAM grant identity changed during reconciliation")
         self.manifest.put("bindings", binding)
         self.set_policy(kind, resource, policy)
 
@@ -843,6 +970,26 @@ class LiveAccess(Access):
         """Use the same provisioner clients and persisted run identity."""
         super().__init__(cloud.config, cloud.clients)
         self.cloud = cloud
+
+    @override
+    def account_propagating(self, error: exceptions.InvalidArgument) -> bool:
+        """Prove this run created the exact principal rejected by Resource Manager."""
+        name = self.gcp.service_account
+        if (
+            not self.gcp.create_service_account
+            or f"service account {name} does not exist" not in str(error).lower()
+        ):
+            return False
+        entry = self.cloud.manifest.lookup("account", name)
+        observed = self.cloud.get("account", name)
+        return (
+            entry is not None
+            and entry.get("absent_before") is True
+            and observed is not None
+            and observed.get("disabled") is not True
+            and bool(text(entry, "id"))
+            and self.cloud.owns(entry, observed)
+        )
 
     @override
     def mutation(

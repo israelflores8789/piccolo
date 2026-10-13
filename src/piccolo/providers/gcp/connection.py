@@ -452,7 +452,7 @@ class GCloudConnection:
         return result.stdout.strip()
 
     def copy(self, zone: str, source: Path, destination: str) -> None:
-        """Copy to a validated relative path using gcloud compute scp."""
+        """Copy a relative path, allowing bounded renewed-key propagation."""
         args = [
             "compute",
             "scp",
@@ -466,12 +466,27 @@ class GCloudConnection:
             args.append("--tunnel-through-iap")
         elif self.config.internal_ip:
             args.append("--internal-ip")
-        result = self.run(args, timeout=120, capture=not self.config.require_passphrase)
-        if result.returncode:
-            raise PiccoloError(
-                f"Bootstrap transfer failed ({result.returncode}): "
-                f"{(result.stderr or '').strip()}"
+        deadline = time.monotonic() + 120
+        for attempt in range(4):
+            result = self.run(
+                args,
+                timeout=max(1, int(deadline - time.monotonic())),
+                capture=not self.config.require_passphrase,
             )
+            if not result.returncode:
+                return
+            diagnostic = (result.stderr or "").strip()
+            if (
+                result.returncode != 255
+                or "permission denied (publickey)" not in diagnostic.lower()
+                or attempt == 3
+                or deadline - time.monotonic() <= 2
+            ):
+                raise PiccoloError(
+                    f"Bootstrap transfer failed ({result.returncode}): {diagnostic}"
+                )
+            # Public-key rejection happens before the file transfer begins.
+            time.sleep(2)
 
     def shell(self, zone: str) -> None:
         """Open SSH in the foreground with terminal input and output intact."""

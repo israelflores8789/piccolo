@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from google.api_core import exceptions
 from google.cloud import compute_v1, iam_admin_v1
 from google.iam.v1 import iam_policy_pb2, options_pb2, policy_pb2
 
+from gcp_live_support.deadline import ACTIVE, bind_clients, live_session, phase, timeout
 from piccolo.config import load
 from piccolo.data import Document, decode, document, objects, text
 from piccolo.errors import PiccoloError
@@ -27,7 +29,11 @@ ACCOUNTS = (
     f"piccolo-test-provisioner@{PROJECT}.iam.gserviceaccount.com",
     f"piccolo-test-vm@{PROJECT}.iam.gserviceaccount.com",
 )
-BASELINE = Path(".test_runs/session-2026-10-12-baseline.json")
+BASELINE = Path(
+    os.environ.get(
+        "PICCOLO_GCP_LIVE_BASELINE", ".test_runs/session-2026-10-12-baseline.json"
+    )
+)
 
 
 def policy(client: object, resource: str) -> Document:
@@ -86,6 +92,181 @@ def save(data: Document) -> None:
         os.fsync(stream.fileno())
 
 
+def inventory(clients: Clients) -> Document:
+    """Report test leftovers across the authorized project without deleting them."""
+    from gcp_live_support.recycle_bin import RecycleBin
+    from piccolo.providers.gcp.resources import SDKCloud
+
+    config = load(Path(".test_runs/approved.toml"))
+    cloud = SDKCloud(config, clients)
+    result: Document = {}
+    for kind in ("instance", "disk", "snapshot"):
+        result[kind] = [
+            text(item, "name")
+            for item in cloud.list(kind)
+            if text(item, "name").startswith("plive-")
+        ]
+    result["firewall"] = [
+        f.name
+        for f in clients.firewalls.list(project=PROJECT, retry=None, timeout=30)
+        if f.name.startswith("plive-")
+    ]
+    result["network"] = [
+        n.name
+        for n in clients.networks.list(
+            project=PROJECT,
+            retry=None,
+            timeout=30,
+        )
+        if n.name.startswith("plive-")
+    ]
+    result["subnet"] = [
+        s.name
+        for region in ("us-west1", "us-east1")
+        for s in clients.subnets.list(
+            project=PROJECT,
+            region=region,
+            retry=None,
+            timeout=30,
+        )
+        if s.name.startswith("plive-")
+    ]
+    result["account"] = [
+        a.email
+        for a in clients.iam.list_service_accounts(
+            name=f"projects/{PROJECT}",
+            retry=None,
+            timeout=30,
+        )
+        if a.email.startswith("plive-")
+    ]
+    result["secret"] = [
+        s.name
+        for s in clients.secrets.list_secrets(
+            parent=f"projects/{PROJECT}",
+            retry=None,
+            timeout=30,
+        )
+        if s.name.rsplit("/", 1)[-1].startswith("plive-")
+    ]
+    result["recoverable_snapshot"] = [
+        text(item, "name")
+        for item in RecycleBin(PROJECT, clients.credentials).inventory()
+        if text(document(item.get("originalResource", {})), "name").startswith("plive-")
+    ]
+    return result
+
+
+def live_workers() -> list[int]:
+    """Identify live pytest workers in this checkout without printing arguments."""
+    root = Path(__file__).resolve().parents[2]
+    executable = str(root / ".venv/bin/pytest").encode()
+    workers: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            arguments = (entry / "cmdline").read_bytes().split(b"\0")
+            if executable in arguments and b"--gcp-live" in arguments:
+                workers.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise PiccoloError(
+                "Cannot verify live workers; cleanup is blocked"
+            ) from exc
+    return workers
+
+
+def finish(clients: Clients) -> None:
+    """Wait for live fixtures, reconcile manifests, remove the network, and verify."""
+    import sys
+
+    from gcp_live_support.gcp_sdk import LiveCloud
+    from gcp_live_support.manifest import Manifest, cleanup
+    from piccolo.state.lock import environment_lock
+
+    deadline = ACTIVE.get()
+    if deadline is None or not os.environ.get("PICCOLO_GCP_LIVE_STARTED_MONOTONIC"):
+        raise PiccoloError("Automatic finalization requires the shared session clock")
+    while workers := live_workers():
+        print(f"Waiting for {len(workers)} live pytest workers", flush=True)
+        with phase("cleanup"):
+            time.sleep(timeout(30))
+    paths: set[Path] = set()
+    for log_path in Path(".test_logs").iterdir():
+        if not log_path.name.startswith("continuation-") or log_path.suffix != ".log":
+            continue
+        for line in log_path.read_text().splitlines():
+            if "Durable cleanup manifest: " in line:
+                path = Path(line.split("Durable cleanup manifest: ", 1)[1])
+                if not path.resolve().is_relative_to(Path(".test_runs").resolve()):
+                    raise PiccoloError("Continuation manifest is outside test state")
+                paths.add(path)
+    failures: list[str] = []
+    with phase("cleanup"):
+        for path in sorted(paths):
+            manifest = Manifest.open(path)
+            if text(manifest.data, "project") != PROJECT:
+                raise PiccoloError("Continuation manifest project differs")
+            if manifest.data.get("complete") is True:
+                continue
+            config = load(Path(text(manifest.data, "config")))
+            if config.gcp.project_id != PROJECT or config.fingerprint != text(
+                manifest.data, "run_settings_fingerprint"
+            ):
+                raise PiccoloError("Continuation recovery settings changed")
+            os.environ["PICCOLO_STATE_DIR"] = str(manifest.directory / "state")
+            with environment_lock(config):
+                failures.extend(
+                    cleanup(
+                        manifest,
+                        LiveCloud(
+                            config,
+                            clients,
+                            manifest,
+                            provisioner=ACCOUNTS[0],
+                        ),
+                        apply=True,
+                    )
+                )
+        if failures:
+            raise PiccoloError("Final manifest cleanup failed: " + "; ".join(failures))
+        baseline = decode(BASELINE.read_text())
+        if baseline.get("project") != PROJECT:
+            raise PiccoloError("Session baseline project differs")
+        network(clients, baseline, create=False)
+    with phase("inventory"):
+        previous = sys.argv
+        try:
+            sys.argv = [previous[0], "verify"]
+            main()
+        finally:
+            sys.argv = previous
+        leftovers = inventory(clients)
+        if any(leftovers.values()):
+            raise PiccoloError("Final test inventory still contains resources")
+    report = {
+        "project": PROJECT,
+        "elapsed_seconds": deadline.clock() - deadline.started,
+        "allowed_seconds": deadline.total_seconds,
+        "iam_preserved": True,
+        "inventory": leftovers,
+        "manifests": [str(path) for path in sorted(paths)],
+    }
+    with os.fdopen(
+        private_file(Path(".test_runs/continuation-final-report.json"), create=True),
+        "w",
+    ) as stream:
+        json.dump(report, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    print(
+        "Final cleanup and original IAM verified; continuation-final-report.json saved",
+        flush=True,
+    )
+
+
 def network(clients: Clients, baseline: Document, *, create: bool) -> None:
     """Create or delete only the recorded session network and temporary role."""
     role, member = "roles/compute.networkAdmin", f"serviceAccount:{ACCOUNTS[0]}"
@@ -142,7 +323,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
         )
         entry["operation"] = operation.name
         save(baseline)
-        operation.result(timeout=120)
+        operation.result(timeout=timeout(120))
         observed = clients.networks.get(
             project=PROJECT, network=name, retry=None, timeout=30
         )
@@ -200,7 +381,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             )
             subnet_entry["operation"] = operation.name
             save(baseline)
-            operation.result(timeout=120)
+            operation.result(timeout=timeout(120))
             subnet = clients.subnets.get(
                 project=PROJECT,
                 region=region,
@@ -227,7 +408,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
                     subnetwork=subnet_name,
                     retry=None,
                     timeout=30,
-                ).result(timeout=120)
+                ).result(timeout=timeout(120))
     if create:
         profile = Path(".test_runs/approved.toml").read_text()
         profile = profile.replace('name = "default"', f'name = "{name}"').replace(
@@ -241,7 +422,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
         if observed is not None:
             clients.networks.delete(
                 project=PROJECT, network=name, retry=None, timeout=30
-            ).result(timeout=120)
+            ).result(timeout=timeout(120))
         if baseline.get("network_admin_added") is True:
             current = clients.projects.get_iam_policy(
                 request=iam_policy_pb2.GetIamPolicyRequest(
@@ -285,6 +466,8 @@ def main() -> None:
             "network-prepare",
             "network-remove",
             "purge-snapshots",
+            "inventory",
+            "finish",
         ),
     )
     args = parser.parse_args()
@@ -297,6 +480,19 @@ def main() -> None:
     if getattr(auth, "service_account_email", None) != ACCOUNTS[0]:
         raise PiccoloError("Session credentials must be the approved provisioner")
     clients = Clients(auth)
+    bind_clients(clients)
+    if args.action == "finish":
+        finish(clients)
+        return
+    if args.action == "inventory":
+        result = inventory(clients)
+        path = BASELINE.with_name(BASELINE.stem + "-inventory.json")
+        with os.fdopen(private_file(path, create=True), "w") as stream:
+            json.dump(result, stream, indent=2)
+        if any(result.values()):
+            raise PiccoloError(f"Test leftovers remain; retained inventory: {path}")
+        print(f"Zero test resources across all inventory families: {path}")
+        return
     if args.action == "purge-snapshots":
         from gcp_live_support.manifest import Manifest
         from gcp_live_support.recycle_bin import RecycleBin
@@ -410,4 +606,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    selected_phase = (
+        "inventory"
+        if any(a in sys.argv for a in ("verify", "inventory"))
+        else "cleanup"
+        if any(a in sys.argv for a in ("network-remove", "purge-snapshots"))
+        else "work"
+    )
+    with live_session(), phase(selected_phase):
+        main()

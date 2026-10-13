@@ -16,7 +16,7 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from gcp_live_support.deadline import check_work, live_session
+from gcp_live_support.deadline import check_work, duration_seconds, live_session
 from gcp_live_support.manifest import Manifest, cleanup, gate
 from piccolo.config import Config, load
 from piccolo.data import Document, text
@@ -31,7 +31,7 @@ def approval_digest(config: Config) -> str:
     policy = {
         "settings": config.fingerprint,
         "move_cases": os.environ.get("PICCOLO_GCP_LIVE_MOVE_CASES", "all"),
-        "duration_seconds": 2700,
+        "duration_seconds": duration_seconds(),
         "cleanup_seconds": 300,
         "inventory_seconds": 60,
         "dummy_payload_sha256": hashlib.sha256(
@@ -296,7 +296,7 @@ def preflight(
         baseline.append(api)
     metadata = cloud.project_metadata()
     reject_startup(metadata)
-    # Run-owned VMs receive OS Login metadata; project metadata is preserved.
+    # Login metadata is instance-scoped; project metadata is preserved.
     for zone in config.gcp.zones:
         cloud.subnet(zone)
     connection.check_identity()

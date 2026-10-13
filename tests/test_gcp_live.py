@@ -51,6 +51,7 @@ from gcp_live_support.manifest import Manifest, cleanup, gate
 from piccolo.data import Document, document, objects, text
 from piccolo.errors import CapacityError, PiccoloError, UncertainError
 from piccolo.logger import emit, log
+from piccolo.privacy import sanitize_text
 
 pytestmark = pytest.mark.gcp_live
 
@@ -71,6 +72,26 @@ def gcp_run(
     if not path:
         pytest.fail("Set PICCOLO_GCP_LIVE_CONFIG to the approved local TOML profile")
     base = profile(Path(path))
+    if request.node.callspec.params.get("workflow") == "init" and (
+        initial_zone := os.environ.get("PICCOLO_GCP_LIVE_INIT_ZONE")
+    ):
+        # Reject the other west zone synthetically; create only in the approved zone.
+        failed_zone = next(z for z in base.gcp.zones if z != initial_zone)
+        base = replace(
+            base,
+            gcp=replace(
+                base.gcp,
+                zones=(
+                    failed_zone,
+                    initial_zone,
+                    *(
+                        z
+                        for z in base.gcp.zones
+                        if z not in {failed_zone, initial_zone}
+                    ),
+                ),
+            ),
+        )
     local_preflight()
     if not fixture_time_available():
         pytest.skip("Less than two minutes of work time remain for a new VM fixture")
@@ -309,15 +330,16 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
     assert text(provider.active(), "status") == "TERMINATED"
     provider.start()
     connection.ready(zone)
-    destination = next(
-        z for z in provider.gcp.zones if z.rsplit("-", 1)[0] != zone.rsplit("-", 1)[0]
-    )
+    destination = zone
     perform_move = not (
         os.environ.get("PICCOLO_GCP_LIVE_MOVE_CASES") == "existing"
         and provider.gcp.create_service_account
     )
     if perform_move:
-        provider.move(destination)
+        for target in provider.gcp.zones:
+            if target != zone:
+                provider.move(target)
+                destination = target
     else:
         destination = zone
         print("Created-account case: relocation covered by existing-account case")
@@ -581,13 +603,16 @@ def test_live_later_fallback_recovery(
     else:
         failed_zone, accepted_zone = provider.gcp.zones[:2]
     original_submit, original_poll = cloud.submit, cloud.poll
+    original_created = provider.created
     accepted_operation = ""
 
     def submit(
         kind: str, name: str, zone: str, resource: Document, request_id: str
     ) -> str:
         nonlocal accepted_operation
-        if kind == "instance.insert" and zone == failed_zone:
+        if zone == failed_zone and (
+            kind == "instance.insert" or (workflow == "init" and kind == "disk.insert")
+        ):
             # No SDK request is sent for this deterministic capacity failure.
             raise CapacityError("Injected confirmed capacity exhaustion")
         operation = original_submit(kind, name, zone, resource, request_id)
@@ -602,6 +627,14 @@ def test_live_later_fallback_recovery(
             raise UncertainError("Injected polling interruption after real acceptance")
         return original_poll(name, zone)
 
+    def created(kind: str, name: str, zone: str, resource: Document) -> Document:
+        if workflow == "init" and kind == "disk" and zone == failed_zone:
+            provider.operations.run(
+                f"disk.insert:{zone}:{name}", "disk.insert", name, zone, resource
+            )
+            raise PiccoloError("Synthetic failure unexpectedly accepted a disk")
+        return original_created(kind, name, zone, resource)
+
     def readiness(_zone: str) -> None:
         raise PiccoloError("Injected readiness interruption")
 
@@ -611,16 +644,17 @@ def test_live_later_fallback_recovery(
     with monkeypatch.context() as injection:
         injection.setattr(cloud, "submit", submit)
         injection.setattr(cloud, "poll", poll)
+        injection.setattr(provider, "created", created)
         if interruption in {"staging", "readiness"}:
             injection.setattr(provider.connection, "ready", readiness)
         if interruption == "commit":
             injection.setattr(provider, "commit_cleanup", commit)
-        with pytest.raises(PiccoloError):
+        with pytest.raises(PiccoloError) as interrupted:
             if workflow == "init":
                 provider.init()
             else:
                 provider.move(None)
-    assert accepted_operation
+    assert accepted_operation, sanitize_text(str(interrupted.value))
     creations = [
         item
         for item in cloud.manifest.entries("actions")

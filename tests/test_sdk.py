@@ -3,12 +3,13 @@
 
 """test_sdk.py — SDK wire contracts with anonymous credentials and mocked methods."""
 
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
 from google.api_core import exceptions
 from google.auth.credentials import AnonymousCredentials
-from google.cloud import compute_v1, resourcemanager_v3, service_usage_v1
+from google.cloud import compute_v1, iam_admin_v1, resourcemanager_v3, service_usage_v1
 from google.iam.v1 import policy_pb2
 
 from piccolo.config import Config
@@ -19,6 +20,89 @@ from piccolo.providers.gcp.clients import Clients
 from piccolo.providers.gcp.operations import failure
 from piccolo.providers.gcp.provision import instance_resource
 from piccolo.providers.gcp.resources import SDKCloud
+from piccolo.state.journal import Journal
+
+
+@pytest.mark.parametrize("scenario", ["new", "preexisting", "replacement", "unrelated"])
+def test_new_account_grant_wait_preserves_policy_and_rejects_unproven_retries(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """Retry only a rejected grant for a newly journaled, unchanged principal."""
+    config = replace(config, gcp=replace(config.gcp, create_service_account=True))
+    journal = Journal(config)
+    journal.begin(
+        {
+            "kind": "init",
+            "access_actions": [
+                {
+                    "key": f"service-account:{config.gcp.service_account}",
+                    "preexisting": scenario == "preexisting",
+                    "status": "done",
+                    "resource_id": "original",
+                }
+            ],
+        }
+    )
+    clients = Clients(AnonymousCredentials())
+    policy = policy_pb2.Policy(version=3, etag=b"original")
+    policy.bindings.add(role="roles/viewer", members=["user:original@example.com"])
+
+    def read(**_kwargs: object) -> policy_pb2.Policy:
+        result = policy_pb2.Policy()
+        result.CopyFrom(policy)
+        return result
+
+    message = (
+        "Invalid role"
+        if scenario == "unrelated"
+        else (f"Service account {config.gcp.service_account} does not exist.")
+    )
+
+    def write(*, request: object, **_kwargs: object) -> None:
+        from google.iam.v1 import iam_policy_pb2
+
+        assert isinstance(request, iam_policy_pb2.SetIamPolicyRequest)
+        if setter.call_count == 1:
+            policy.etag = b"concurrent"
+            policy.bindings.add(
+                role="roles/viewer", members=["user:concurrent@example.com"]
+            )
+            raise exceptions.InvalidArgument(message)
+        assert request.policy.etag == b"concurrent"
+        policy.CopyFrom(request.policy)
+
+    monkeypatch.setattr(clients.projects, "get_iam_policy", read)
+    setter = Mock(side_effect=write)
+    monkeypatch.setattr(clients.projects, "set_iam_policy", setter)
+    monkeypatch.setattr(
+        clients.iam,
+        "get_service_account",
+        Mock(
+            return_value=iam_admin_v1.ServiceAccount(
+                unique_id="replacement" if scenario == "replacement" else "original"
+            )
+        ),
+    )
+    monkeypatch.setattr("piccolo.providers.gcp.access.time.sleep", lambda _delay: None)
+    access = Access(config, clients, journal)
+    if scenario != "new":
+        with pytest.raises(UncertainError) as caught:
+            access.grant(
+                f"projects/{config.gcp.project_id}", "roles/viewer", secret=False
+            )
+        assert isinstance(caught.value.__cause__, exceptions.InvalidArgument)
+        assert setter.call_count == 1
+    else:
+        access.grant(f"projects/{config.gcp.project_id}", "roles/viewer", secret=False)
+        assert setter.call_count == 2
+        members = {m for b in policy.bindings for m in b.members}
+        assert members == {
+            "user:original@example.com",
+            "user:concurrent@example.com",
+            f"serviceAccount:{config.gcp.service_account}",
+        }
 
 
 def test_instance_payload_can_be_encoded_by_sdk(config: Config) -> None:

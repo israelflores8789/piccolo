@@ -6,6 +6,7 @@
 import argparse
 from pathlib import Path
 
+from gcp_live_support.deadline import duration_seconds
 from gcp_live_support.gcp_live import approval_digest
 
 from piccolo.config import load
@@ -24,7 +25,7 @@ def main() -> None:
             "approval_sha256": approval_digest(config),
             "project": config.gcp.project_id,
             "settings": canonical_value(config.gcp),
-            "deadline_seconds": 2700,
+            "deadline_seconds": duration_seconds(),
             "cleanup_seconds": 300,
             "dollar_limit_enforced": False,
         }

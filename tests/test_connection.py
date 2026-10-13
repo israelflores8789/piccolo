@@ -38,6 +38,42 @@ def test_connection_uses_configured_user_project_and_iap(config: Config) -> None
     assert "--project=test-project" in connection.flags()
 
 
+def test_scp_retries_key_propagation_before_transfer(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Retry pre-authentication rejection while retaining the same transfer flags."""
+    connection = GCloudConnection(config.gcp)
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 255, "", "Permission denied (publickey)."),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+    monkeypatch.setattr(connection, "run", run)
+    monkeypatch.setattr("piccolo.providers.gcp.connection.time.sleep", Mock())
+    connection.copy("us-west1-a", tmp_path / "source", "destination")
+    assert run.call_count == 2
+    assert run.call_args_list[0].args == run.call_args_list[1].args
+
+
+def test_scp_never_replays_a_failure_after_authentication(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Preserve uncertain partial transfers for operator inspection."""
+    connection = GCloudConnection(config.gcp)
+    run = Mock(
+        return_value=subprocess.CompletedProcess([], 255, "", "Connection reset")
+    )
+    monkeypatch.setattr(connection, "run", run)
+    with pytest.raises(PiccoloError, match="Connection reset"):
+        connection.copy("us-west1-a", tmp_path / "source", "destination")
+    run.assert_called_once()
+
+
 def test_shell_is_foreground_and_no_local_shell_interpolation(
     config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
