@@ -9,6 +9,24 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+### Added
+
+- Native Windows OpenSSH transport with explicit expiring metadata/OS Login authorization, immutable host trust, protected shared-key preparation, and binary IAP proxy execution.
+- Pywin32-backed private Windows storage, handle-based ownership and DACL verification, safe file-descriptor transfer, and job-based connection process-tree cleanup.
+- Native Windows offline ACL, key, locking, proxy, and process tests; Linux/Windows/macOS local CI on Python 3.12 and 3.14; separately selectable `gcp_win_live` tests that remain unrun in this implementation.
+
+### Changed
+
+- Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.
+- Centralize Cloud SDK configuration paths and prefer the Windows SDK's bundled interpreter when present; retain separate SDK and connection identities.
+- Extract shared GCP SSH behavior behind one transport interface and add `just test-local` with explicit live-test exclusions.
+
+### Fixed
+
+- Replace selector-based pipe capture with bounded reader-thread capture and preserve foreground terminal handles.
+- Create private journal replacements and upload files before writing their contents; generate bootstrap runners with LF endings on Windows.
+- Preserve pytest argument boundaries and make live spending-ledger locking portable without running live tests.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

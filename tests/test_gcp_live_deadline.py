@@ -49,7 +49,8 @@ def test_restarted_live_process_preserves_session_start(
     with live_session() as second:
         assert second.started == started
         assert second.remaining() <= remaining
-        assert second.remaining() < TOTAL_SECONDS - CLEANUP_SECONDS - 200
+        # Windows Python 3.12 can observe both calls within one clock tick.
+        assert second.remaining() <= TOTAL_SECONDS - CLEANUP_SECONDS - 200
 
 
 def test_explicit_duration_extension_preserves_anchor_and_changes_approval(

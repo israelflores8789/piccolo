@@ -5,14 +5,15 @@
 
 import json
 import os
-import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from conftest import FakeCloud, GuestConnection
+from platform_support import assert_private, redirect
 
 from piccolo.config import Config, load
 from piccolo.data import document, text
@@ -143,12 +144,12 @@ def test_state_repairs_owned_modes_and_redacts_errors(config: Config) -> None:
     journal.directory.chmod(0o755)
     journal.path.chmod(0o644)
     restored = Journal(config)
-    assert stat.S_IMODE(restored.directory.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(restored.directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE(restored.path.stat().st_mode) == 0o600
+    assert_private(restored.directory.parent, directory=True)
+    assert_private(restored.directory, directory=True)
+    assert_private(restored.path)
     assert "secret-material" not in restored.path.read_text()
     with environment_lock(config):
-        assert stat.S_IMODE((journal.directory / "lock").stat().st_mode) == 0o600
+        assert_private(journal.directory / "lock")
 
 
 @pytest.mark.parametrize(
@@ -167,19 +168,19 @@ def test_state_rejects_symlinks_and_hardlinks(
     journal = Journal(config)
     if target == "root":
         root = tmp_path / "redirected-state"
-        root.symlink_to(outside, target_is_directory=True)
+        redirect(root, outside, directory=True)
         monkeypatch.setenv("PICCOLO_STATE_DIR", str(root))
     else:
         journal.directory.parent.mkdir(mode=0o700)
         if target == "environment":
-            journal.directory.symlink_to(outside, target_is_directory=True)
+            redirect(journal.directory, outside, directory=True)
         else:
             journal.directory.mkdir(mode=0o700)
             path = journal.directory / ("lock" if target == "lock" else "state.json")
             if target == "hardlink":
                 os.link(victim, path)
             else:
-                path.symlink_to(victim)
+                redirect(path, victim)
     with pytest.raises(PiccoloError):
         if target == "lock":
             with environment_lock(config):
@@ -194,7 +195,15 @@ def test_state_rejects_foreign_ownership(
 ) -> None:
     journal = Journal(config)
     journal.begin({"kind": "init"})
-    monkeypatch.setattr("piccolo.state.storage.os.getuid", lambda: -1)
+    if sys.platform == "win32":
+        import win32security
+
+        monkeypatch.setattr(
+            "piccolo.state.windows.current_sid",
+            lambda: win32security.ConvertStringSidToSid("S-1-5-18"),
+        )
+    else:
+        monkeypatch.setattr("piccolo.state.storage.os.getuid", lambda: -1)
     with pytest.raises(PiccoloError, match="not owned"):
         Journal(config)
 
@@ -207,7 +216,9 @@ def test_state_rejects_parent_traversal_after_a_symlink(
     outside = tmp_path / "outside"
     outside.mkdir()
     redirect = tmp_path / "redirect"
-    redirect.symlink_to(outside, target_is_directory=True)
+    from platform_support import redirect as make_redirect
+
+    make_redirect(redirect, outside, directory=True)
     monkeypatch.setenv("PICCOLO_STATE_DIR", str(redirect / ".." / "state"))
     with pytest.raises(PiccoloError, match="parent traversal"):
         Journal(config)
@@ -336,11 +347,11 @@ def test_operator_credential_filenames_are_ignored() -> None:
         "private.pem",
     ]
     result = subprocess.run(
-        ["git", "check-ignore", "--stdin"],
-        input="\n".join(paths),
+        ["git", "check-ignore", "-z", "--stdin"],
+        input="\0".join(paths) + "\0",
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0
-    assert result.stdout.splitlines() == paths
+    assert result.stdout.rstrip("\0").split("\0") == paths

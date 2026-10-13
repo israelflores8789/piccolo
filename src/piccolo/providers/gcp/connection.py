@@ -1,28 +1,29 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 
-"""connection.py — gcloud transport for SSH, opaque file transfer, and IAP."""
+"""connection.py — gcloud identity facade and platform-independent SSH/IAP dispatch."""
 
-import base64
-import binascii
-import codecs
 import os
-import re
-import selectors
-import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from piccolo.config.models import GCP
-from piccolo.data import Document, decode, document, objects, text
+from piccolo.data import Document, decode, document
 from piccolo.errors import PiccoloError
 from piccolo.logger import log
+from piccolo.paths import cloud_sdk_directory
+from piccolo.process import run_command
+from piccolo.providers.gcp.ssh import SSHTransport
+from piccolo.state.storage import (
+    PrivateTemporaryDirectory,
+    private_directory,
+    private_file,
+)
 
 AUTH_OVERRIDES = (
     "CLOUDSDK_AUTH_ACCESS_TOKEN",
@@ -47,15 +48,21 @@ class GCloudConnection:
         self.windows = os.name == "nt"
         self.selected_account = config.connection_account
         self.identity_checked = False
+        self.deadline: float | None = None
         self.target = target
         self.host_keys = host_keys
-        self.host_directory = tempfile.TemporaryDirectory(prefix="piccolo-host-trust-")
+        self.host_directory = PrivateTemporaryDirectory("piccolo-host-trust-")
         self.host_files: dict[str, tuple[str, Path]] = {}
         self.user_home = Path.home()
+        self.key_file = self.user_home / ".ssh" / "google_compute_engine"
         self.known_hosts = (
             Path(self.host_directory.name) / ".ssh" / "google_compute_known_hosts"
         )
-        self.known_hosts.parent.mkdir(mode=0o700)
+        private_directory(self.known_hosts.parent)
+        self.empty_config = self.known_hosts.parent / "empty"
+        os.close(private_file(self.empty_config, create=True, exclusive=True))
+        self.sdk_directory = cloud_sdk_directory()
+        self.ssh = SSHTransport(self)
 
     def executable(self) -> str:
         """Resolve gcloud, including Windows command shims."""
@@ -89,7 +96,11 @@ class GCloudConnection:
                     "Cannot locate the Windows SDK Python entry point; "
                     "install the full Google Cloud CLI"
                 )
-            return [os.environ.get("CLOUDSDK_PYTHON", sys.executable), str(entry)]
+            bundled = entry.parent.parent / "platform" / "bundledpython" / "python.exe"
+            interpreter = os.environ.get("CLOUDSDK_PYTHON") or (
+                str(bundled) if bundled.is_file() else sys.executable
+            )
+            return [interpreter, str(entry)]
         return [executable]
 
     def run(
@@ -100,15 +111,14 @@ class GCloudConnection:
         if arguments[:1] == ["compute"] and not self.identity_checked:
             self.check_identity()
         if arguments[:2] in (["compute", "ssh"], ["compute", "scp"]):
-            environment["CLOUDSDK_CONFIG"] = environment.get(
-                "CLOUDSDK_CONFIG", str(self.user_home / ".config" / "gcloud")
-            )
+            environment["CLOUDSDK_CONFIG"] = str(self.sdk_directory)
             environment["HOME"] = self.host_directory.name
         return self.invoke(arguments, environment, timeout=timeout, capture=capture)
 
     def environment(self) -> dict[str, str]:
         """Reject inherited credentials before inspecting the local CLI config."""
         environment = os.environ.copy()
+        environment["CLOUDSDK_CONFIG"] = str(self.sdk_directory)
         for variable in AUTH_OVERRIDES:
             if environment.get(variable):
                 raise PiccoloError(f"Unset {variable} before gcloud connections")
@@ -163,6 +173,12 @@ class GCloudConnection:
         use_flags: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Launch gcloud using an already inspected environment snapshot."""
+        bounded: float | None = timeout
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise PiccoloError("SSH connection preparation timed out")
+            bounded = remaining if timeout is None else min(timeout, remaining)
         interactive = self.config.require_passphrase and arguments[:2] in (
             ["compute", "ssh"],
             ["compute", "scp"],
@@ -171,13 +187,22 @@ class GCloudConnection:
             raise PiccoloError("Passphrase prompts require an interactive terminal")
         try:
             if interactive and capture:
-                return self.interactive_invoke(arguments, environment, timeout=timeout)
+                return self.interactive_invoke(arguments, environment, timeout=bounded)
+            if self.windows and arguments[:2] == ["compute", "start-iap-tunnel"]:
+                return run_command(
+                    [*self.launcher(), *arguments, *self.flags()],
+                    environment,
+                    timeout=bounded,
+                    capture=capture,
+                )
             return subprocess.run(
                 [*self.launcher(), *arguments, *(self.flags() if use_flags else [])],
                 shell=False,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=capture,
-                timeout=timeout,
+                timeout=bounded,
                 env=environment,
                 check=False,
             )
@@ -206,59 +231,12 @@ class GCloudConnection:
                     f"printf '{marker}\\n'; exit \"$rc\""
                 )
         command = [*self.launcher(), *framed, *self.flags()]
-        output: list[str] = []
-        with subprocess.Popen(
-            command, shell=False, text=True, stdout=subprocess.PIPE, env=environment
-        ) as process:
-            stream = process.stdout
-            if stream is None:
-                raise PiccoloError("Interactive gcloud stdout is unavailable")
-
-            deadline = None if timeout is None else time.monotonic() + timeout
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            os.set_blocking(stream.fileno(), False)
-            with selectors.DefaultSelector() as selector:
-                selector.register(stream, selectors.EVENT_READ)
-                while True:
-                    if (
-                        timeout is not None
-                        and deadline is not None
-                        and time.monotonic() >= deadline
-                    ):
-                        process.kill()
-                        process.wait()
-                        raise subprocess.TimeoutExpired(command, timeout)
-                    events = selector.select(timeout=0.1)
-                    if not events and process.poll() is not None:
-                        break
-                    if events:
-                        try:
-                            chunk = os.read(stream.fileno(), 4096)
-                        except BlockingIOError:
-                            continue
-                        if not chunk:
-                            break
-                        rendered = decoder.decode(chunk)
-                        output.append(rendered)
-                        sys.stdout.write(rendered)
-                        sys.stdout.flush()
-                rendered = decoder.decode(b"", final=True)
-                output.append(rendered)
-                sys.stdout.write(rendered)
-                sys.stdout.flush()
-            remaining = (
-                None if deadline is None else max(0, deadline - time.monotonic())
-            )
-            try:
-                code = process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                raise
-        captured = "".join(output)
-        pieces = captured.split(marker + "\n")
+        result = run_command(command, environment, timeout=timeout, prompts=True)
+        pieces = result.stdout.replace("\r\n", "\n").split(marker + "\n")
         remote_output = pieces[1] if len(pieces) >= 3 else ""
-        return subprocess.CompletedProcess(command, code, remote_output, "")
+        return subprocess.CompletedProcess(
+            command, result.returncode, remote_output, ""
+        )
 
     def check_identity(self) -> None:
         """Report the connection identity and enforce explicit credential separation."""
@@ -299,200 +277,33 @@ class GCloudConnection:
         )
 
     def host_options(self, zone: str, flag: str) -> list[str]:
-        """Enroll host keys through authenticated GCP reads bound to the selected ID."""
-        if self.windows:
-            raise PiccoloError(
-                "Verified SSH host enrollment currently requires OpenSSH on Linux/macOS"
-            )
-        if self.target is None:
-            raise PiccoloError("SSH requires a provider-bound instance identity")
-        selected = self.target(zone)
-        identity = text(selected, "id")
-        if not identity.isdecimal():
-            raise PiccoloError("Cannot verify SSH instance identity")
-        alias = f"compute.{identity}"
-        enrolled = self.host_files.get(zone)
-        if enrolled is None or enrolled[0] != identity:
-            if self.host_keys is None:
-                raise PiccoloError("SSH requires authenticated Compute host-key reads")
-            entries = objects(
-                document(self.host_keys(zone).get("query_value", {})), "items"
-            )
-            lines: list[str] = []
-            for entry in entries:
-                algorithm, value = text(entry, "key"), text(entry, "value")
-                if text(entry, "namespace") != "hostkeys" or algorithm not in {
-                    "ssh-ed25519",
-                    "ssh-rsa",
-                    "ecdsa-sha2-nistp256",
-                    "ecdsa-sha2-nistp384",
-                    "ecdsa-sha2-nistp521",
-                }:
-                    continue
-                if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value):
-                    raise PiccoloError("Malformed GCP host key")
-                try:
-                    decoded = base64.b64decode(value, validate=True)
-                    length = int.from_bytes(decoded[:4], "big")
-                    if decoded[4 : 4 + length] != algorithm.encode():
-                        raise ValueError("SSH key algorithm mismatch")
-                except (ValueError, binascii.Error) as exc:
-                    raise PiccoloError("Malformed GCP host key") from exc
-                lines.append(f"{alias} {algorithm} {value}\n")
-            if not lines:
-                raise PiccoloError(
-                    "No trusted GCP host keys are published. Enable "
-                    "enable-guest-attributes and have the Google guest agent publish "
-                    "hostkeys before connecting; unknown SSH host keys are refused."
-                )
-            if text(self.target(zone), "id") != identity:
-                raise PiccoloError("Instance changed during host-key enrollment")
-            path = self.known_hosts
-            with path.open("a") as stream:
-                stream.write("".join(lines))
-            path.chmod(0o600)
-            self.host_files[zone] = (identity, path)
-        path = self.host_files[zone][1]
-        return [
-            "--strict-host-key-checking=yes",
-            f"--ssh-key-expire-after={self.config.expire_after}",
-            f"--ssh-key-file={self.user_home / '.ssh' / 'google_compute_engine'}",
-            f"--{flag}=-oHostKeyAlias={alias}",
-            f"--{flag}=-oUserKnownHostsFile={path}",
-            f"--{flag}=-oGlobalKnownHostsFile=/dev/null",
-            f"--{flag}=-oKnownHostsCommand=none",
-            f"--{flag}=-oVerifyHostKeyDNS=no",
-            f"--{flag}=-oUpdateHostKeys=no",
-            f"--{flag}=-F/dev/null",
-            f"--{flag}=-oCheckHostIP=no",
-        ]
+        """Enroll authenticated host keys through the shared SSH component."""
+        return self.ssh.host_options(zone, flag)
 
     def ssh_arguments(self, zone: str, command: str | None = None) -> list[str]:
-        """Build a gcloud SSH command for the configured development user."""
-        args = [
-            "compute",
-            "ssh",
-            f"{self.config.ssh_user}@{self.config.name}",
-            f"--zone={zone}",
-        ]
-        args.extend(self.host_options(zone, "ssh-flag"))
-        if self.config.via_iap:
-            args.append("--tunnel-through-iap")
-        elif self.config.internal_ip:
-            args.append("--internal-ip")
-        if command is not None:
-            user = shlex.quote(self.config.ssh_user)
-            command = (
-                f'if test "$(id -un)" != {user}; then '
-                "printf 'Piccolo SSH user mismatch; review gcp.ssh.user\\n' >&2; "
-                f"exit 65; fi; {command}"
-            )
-            args.extend(
-                [
-                    f"--command={command}",
-                    "--ssh-flag=-oBatchMode=yes",
-                    "--ssh-flag=-oConnectTimeout=10",
-                    "--ssh-flag=-oConnectionAttempts=1",
-                ]
-            )
-        return args
+        """Retain the gcloud argument contract for the POSIX transport."""
+        return self.ssh.ssh_arguments(zone, command)
 
     def ready(self, zone: str) -> None:
-        """Retry actual SSH boot failures until a bounded readiness deadline."""
-        self.check_identity()
-        deadline = time.monotonic() + self.config.readiness_timeout
-        diagnostic = "SSH not ready"
-        while time.monotonic() < deadline:
-            remaining = max(1, int(deadline - time.monotonic()))
-            try:
-                result = self.run(
-                    self.ssh_arguments(zone, "true"), timeout=min(25, remaining)
-                )
-                if result.returncode == 0:
-                    if self.config.readiness_command:
-                        self.execute(
-                            zone, self.config.readiness_command, timeout=remaining
-                        )
-                    return
-                diagnostic = result.stderr.strip()
-                if result.returncode == 65:
-                    raise PiccoloError("SSH user mismatch; review gcp.ssh.user")
-                if any(
-                    marker in diagnostic.lower()
-                    for marker in (
-                        "permission denied",
-                        "forbidden",
-                        "not authorized",
-                        "does not have permission",
-                        "invalid choice",
-                        "not found",
-                        "does not support ssh",
-                    )
-                ):
-                    raise PiccoloError(
-                        f"SSH configuration or permission failure: {diagnostic}"
-                    )
-            except PiccoloError as exc:
-                if "timed out" not in str(
-                    exc
-                ) and "No trusted GCP host keys" not in str(exc):
-                    raise
-                diagnostic = str(exc)
-            log(f"Waiting for SSH in {zone}...")
-            time.sleep(min(2, max(0, deadline - time.monotonic())))
-        raise PiccoloError(f"SSH readiness timed out: {diagnostic}")
+        """Wait for authenticated SSH with a bounded readiness deadline."""
+        self.ssh.ready(zone)
 
     def execute(self, zone: str, command: str, timeout: int = 60) -> str:
-        """Execute a project-owned remote command with a deadline."""
-        result = self.run(self.ssh_arguments(zone, command), timeout=timeout)
-        if result.returncode:
-            raise PiccoloError(
-                f"Remote command failed ({result.returncode}): {result.stderr.strip()}"
-            )
-        return result.stdout.strip()
+        """Execute through the platform-selected SSH component."""
+        return self.ssh.execute(zone, command, timeout)
 
     def copy(self, zone: str, source: Path, destination: str) -> None:
-        """Copy a relative path, allowing bounded renewed-key propagation."""
-        args = [
-            "compute",
-            "scp",
-            str(source),
-            f"{self.config.ssh_user}@{self.config.name}:~/{destination}",
-            f"--zone={zone}",
-        ]
-        args.extend(self.host_options(zone, "scp-flag"))
-        args.append("--scp-flag=-oBatchMode=yes")
-        if self.config.via_iap:
-            args.append("--tunnel-through-iap")
-        elif self.config.internal_ip:
-            args.append("--internal-ip")
-        deadline = time.monotonic() + 120
-        for attempt in range(4):
-            result = self.run(
-                args,
-                timeout=max(1, int(deadline - time.monotonic())),
-                capture=not self.config.require_passphrase,
-            )
-            if not result.returncode:
-                return
-            diagnostic = (result.stderr or "").strip()
-            if (
-                result.returncode != 255
-                or "permission denied (publickey)" not in diagnostic.lower()
-                or attempt == 3
-                or deadline - time.monotonic() <= 2
-            ):
-                raise PiccoloError(
-                    f"Bootstrap transfer failed ({result.returncode}): {diagnostic}"
-                )
-            # Public-key rejection happens before the file transfer begins.
-            time.sleep(2)
+        """Transfer through the platform-selected SSH component."""
+        self.ssh.copy(zone, source, destination)
 
     def shell(self, zone: str) -> None:
-        """Open SSH in the foreground with terminal input and output intact."""
-        result = self.run(self.ssh_arguments(zone), timeout=None, capture=False)
-        if result.returncode:
-            raise PiccoloError(f"SSH session exited with status {result.returncode}")
+        """Open a foreground SSH session with terminal IO intact."""
+        self.ssh.shell(zone)
+
+    def before_ssh(self, zone: str) -> None:
+        """Validate connection identity before preparing or authorizing a key."""
+        del zone
+        self.check_identity()
 
     def tunnel(self, zone: str) -> None:
         """Forward the configured port to localhost until interrupted."""

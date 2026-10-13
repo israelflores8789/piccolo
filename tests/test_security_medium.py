@@ -432,6 +432,10 @@ def test_unknown_source_settings_fail_before_stop(
 @pytest.mark.parametrize(
     "component", [".piccolo", ".piccolo/bootstrap", ".piccolo/bootstrap/setup.sh"]
 )
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Linux guest symlink semantics require a POSIX test filesystem",
+)
 def test_staging_rejects_guest_symlinks(
     bootstrap_config: Config,
     cloud: FakeCloud,
@@ -450,6 +454,10 @@ def test_staging_rejects_guest_symlinks(
     assert not list(external.iterdir())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Linux guest modes require POSIX; native upload ACLs have separate coverage",
+)
 def test_script_and_runner_are_private_before_copy(
     bootstrap_config: Config,
     cloud: FakeCloud,
@@ -511,7 +519,10 @@ def test_host_enrollment_uses_authenticated_instance_keys(
 ) -> None:
     algorithm = b"ssh-ed25519"
     encoded = base64.b64encode(
-        len(algorithm).to_bytes(4, "big") + algorithm + b"testkey"
+        len(algorithm).to_bytes(4, "big")
+        + algorithm
+        + (32).to_bytes(4, "big")
+        + b"k" * 32
     ).decode()
     calls: list[str] = []
 
@@ -533,7 +544,9 @@ def test_host_enrollment_uses_authenticated_instance_keys(
     assert calls == ["us-west1-a"]
     path = connection.host_files["us-west1-a"][1]
     assert encoded in path.read_text()
-    assert path.stat().st_mode & 0o777 == 0o600
+    from platform_support import assert_private
+
+    assert_private(path)
 
 
 @pytest.mark.parametrize("changed", [False, True])
@@ -544,7 +557,10 @@ def test_host_enrollment_refuses_unknown_or_replaced_vm(
     connection = GCloudConnection(config.gcp, identity)
     algorithm = b"ssh-ed25519"
     key = base64.b64encode(
-        len(algorithm).to_bytes(4, "big") + algorithm + b"testkey"
+        len(algorithm).to_bytes(4, "big")
+        + algorithm
+        + (32).to_bytes(4, "big")
+        + b"k" * 32
     ).decode()
     entries = (
         [{"namespace": "hostkeys", "key": "ssh-ed25519", "value": key}]
@@ -564,6 +580,8 @@ def test_passphrase_mode_forwards_prompts_and_preserves_output(
     config: Config, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     connection = GCloudConnection(replace(config.gcp, require_passphrase=True))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(connection, "launcher", lambda: ["ignored"])
     real_popen = subprocess.Popen
 
@@ -574,7 +592,7 @@ def test_passphrase_mode_forwards_prompts_and_preserves_output(
             if argument.startswith("--command=")
         )
         assert "--quiet" not in args
-        assert "stdin" not in kwargs and "stderr" not in kwargs
+        assert "stdin" not in kwargs and kwargs.get("stderr") is None
         return real_popen(
             ["bash", "-c", "printf 'gcloud prompt\\n'; " + command], **kwargs
         )
@@ -594,7 +612,10 @@ def test_scp_uses_isolated_host_trust_and_normal_gcloud_key_path(
 ) -> None:
     algorithm = b"ssh-ed25519"
     value = base64.b64encode(
-        len(algorithm).to_bytes(4, "big") + algorithm + b"testkey"
+        len(algorithm).to_bytes(4, "big")
+        + algorithm
+        + (32).to_bytes(4, "big")
+        + b"k" * 32
     ).decode()
     connection = GCloudConnection(
         config.gcp,
@@ -627,10 +648,10 @@ def test_scp_uses_isolated_host_trust_and_normal_gcloud_key_path(
         in args
     )
     assert "--scp-flag=-oBatchMode=yes" in args
-    assert "--scp-flag=-F/dev/null" in args
+    assert "--scp-flag=-Fnone" in args
     environment = invoke.call_args.kwargs["env"]
     assert environment["HOME"] == connection.host_directory.name
-    assert environment["CLOUDSDK_CONFIG"] == "/original/gcloud"
+    assert environment["CLOUDSDK_CONFIG"] == str(connection.sdk_directory)
     assert (
         connection.known_hosts
         == Path(environment["HOME"]) / ".ssh" / "google_compute_known_hosts"
@@ -642,7 +663,10 @@ def test_host_publication_is_polled_without_accepting_unknown_keys(
 ) -> None:
     algorithm = b"ssh-ed25519"
     key = base64.b64encode(
-        len(algorithm).to_bytes(4, "big") + algorithm + b"key"
+        len(algorithm).to_bytes(4, "big")
+        + algorithm
+        + (32).to_bytes(4, "big")
+        + b"k" * 32
     ).decode()
     host_keys = Mock(
         side_effect=[
@@ -660,9 +684,7 @@ def test_host_publication_is_polled_without_accepting_unknown_keys(
     monkeypatch.setattr(connection, "check_identity", lambda: None)
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(connection, "run", run)
-    monkeypatch.setattr(
-        "piccolo.providers.gcp.connection.time.sleep", lambda _seconds: None
-    )
+    monkeypatch.setattr("piccolo.providers.gcp.ssh.time.sleep", lambda _seconds: None)
     connection.ready("us-west1-a")
     assert host_keys.call_count == 2
     run.assert_called_once()
@@ -1009,6 +1031,8 @@ def test_interactive_timeout_returns_with_descendant_stdout_open(
     config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     connection = GCloudConnection(replace(config.gcp, require_passphrase=True))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(connection, "launcher", lambda: ["ignored"])
     real_popen = subprocess.Popen
 

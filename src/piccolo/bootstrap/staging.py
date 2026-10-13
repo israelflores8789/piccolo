@@ -4,8 +4,8 @@
 """staging.py — Stage immutable project-owned bootstrap bytes without running them."""
 
 import hashlib
+import os
 import shlex
-import tempfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -14,6 +14,7 @@ from piccolo.data import Document, document, text
 from piccolo.errors import PiccoloError
 from piccolo.providers.base import Connection
 from piccolo.state.journal import Journal
+from piccolo.state.storage import private_file, temporary_directory
 
 
 def home_path(path: str) -> str:
@@ -68,10 +69,12 @@ def upload(
     if hashlib.sha256(contents).hexdigest() != digest:
         raise PiccoloError("Local artifact changed before transfer")
     connection.execute(zone, private_path(destination, prepare=True))
-    with tempfile.TemporaryDirectory(prefix="piccolo-upload-") as directory:
-        private_source = Path(directory) / "artifact"
-        private_source.write_bytes(contents)
-        private_source.chmod(0o600)
+    with temporary_directory("piccolo-upload-") as directory:
+        private_source = directory / "artifact"
+        with os.fdopen(
+            private_file(private_source, create=True, exclusive=True), "wb"
+        ) as stream:
+            stream.write(contents)
         connection.copy(zone, private_source, destination)
     connection.execute(zone, private_path(destination))
     observed = connection.execute(zone, f"sha256sum {home_path(destination)}").split()
@@ -123,9 +126,12 @@ def stage(
     destination = home_path(setup.remote_path)
     connection.execute(zone, private_path(setup.remote_path))
     temporary = f"{setup.remote_path}.upload-{digest[:12]}"
-    with tempfile.TemporaryDirectory(prefix="piccolo-stage-") as temporary_directory:
-        local = Path(temporary_directory) / "script.sh"
-        local.write_bytes(source)
+    with temporary_directory("piccolo-stage-") as directory:
+        local = directory / "script.sh"
+        with os.fdopen(
+            private_file(local, create=True, exclusive=True), "wb"
+        ) as stream:
+            stream.write(source)
         upload(connection, zone, local, temporary, digest)
     connection.execute(
         zone,

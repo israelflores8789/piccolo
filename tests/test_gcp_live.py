@@ -21,6 +21,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -53,7 +54,12 @@ from piccolo.errors import CapacityError, PiccoloError, UncertainError
 from piccolo.logger import emit, log
 from piccolo.privacy import sanitize_text
 
-pytestmark = pytest.mark.gcp_live
+pytestmark = [
+    pytest.mark.gcp_live,
+    pytest.mark.skipif(
+        sys.platform == "win32", reason="Native Windows live tests use --gcp-win-live"
+    ),
+]
 
 
 @pytest.fixture(
@@ -65,13 +71,25 @@ def gcp_run(
     isolated_state: None,
 ) -> Generator["GCPProvider"]:
     del isolated_state
-    if not request.config.getoption("--gcp-live"):
-        pytest.skip("requires --gcp-live")
+    gcp_win_live = request.config.getoption("--gcp-win-live")
+    if not (request.config.getoption("--gcp-live") or gcp_win_live):
+        pytest.skip("requires an explicit provider/platform live selection")
     gate(os.environ.get("PICCOLO_GCP_LIVE_PROJECT", ""))
     path = os.environ.get("PICCOLO_GCP_LIVE_CONFIG")
     if not path:
         pytest.fail("Set PICCOLO_GCP_LIVE_CONFIG to the approved local TOML profile")
     base = profile(Path(path))
+    if gcp_win_live and not os.environ.get("PICCOLO_GCP_LIVE_BUDGET_FILE"):
+        pytest.fail("Windows live tests require an explicitly reviewed spending ledger")
+    if gcp_win_live and (
+        base.gcp.connection_account
+        != f"piccolo-test-provisioner@{base.gcp.project_id}.iam.gserviceaccount.com"
+        or base.gcp.connection_impersonate
+    ):
+        pytest.fail(
+            "Automated Windows live checks require the test provisioner's "
+            "gcloud login; human terminal acceptance needs separate scoped approval"
+        )
     if request.node.callspec.params.get("workflow") == "init" and (
         initial_zone := os.environ.get("PICCOLO_GCP_LIVE_INIT_ZONE")
     ):
@@ -92,7 +110,7 @@ def gcp_run(
                 ),
             ),
         )
-    local_preflight()
+    local_preflight(base)
     if not fixture_time_available():
         pytest.skip("Less than two minutes of work time remain for a new VM fixture")
     from gcp_live_support.gcp_sdk import LiveCloud
@@ -106,7 +124,13 @@ def gcp_run(
 
     run = f"plive-{uuid.uuid4().hex[:16]}"
     directory = Path(".test_runs").resolve() / run
-    config = run_config(base, directory, run, create_account=bool(request.param))
+    config = run_config(
+        base,
+        directory,
+        run,
+        create_account=bool(request.param),
+        bootstrap=not gcp_win_live,
+    )
     manifest = Manifest.create(
         directory / "manifest.json", config.path, run, project=config.gcp.project_id
     )

@@ -8,6 +8,7 @@ Live use requires PICCOLO_GCP_LIVE_PROJECT; offline fixtures set it locally.
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -888,26 +889,45 @@ def test_reopened_manifest_preserves_secret_cleanup_identifiers(
     assert reopened.data["complete"] is True
 
 
-def test_live_recipe_preserves_pytest_argument_boundaries(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "recipe, option, suite",
+    [
+        ("test-gcp-live", "--gcp-live", "tests/test_gcp_live.py"),
+        ("test-gcp-win-live", "--gcp-win-live", "tests/test_gcp_win_live.py"),
+    ],
+)
+def test_live_recipe_preserves_pytest_argument_boundaries(
+    tmp_path: Path, recipe: str, option: str, suite: str
+) -> None:
     """Pass spaced selections and literal shell syntax through the live recipe."""
     binary = tmp_path / "bin"
     binary.mkdir()
     stub = binary / "uv"
-    stub.write_text(
-        "#!/usr/bin/env python3\n"
+    script = binary / "uv_stub.py"
+    script.write_text(
         "# Copyright 2026 Israel Flores-Arbolay\n"
         "# SPDX-License-Identifier: Apache-2.0\n"
-        '"""uv — Record arguments without running cloud clients."""\n'
+        '"""uv - Record arguments without running cloud clients."""\n'
         "import json, sys\nfrom pathlib import Path\n"
         "Path('.test_logs').mkdir(exist_ok=True)\n"
         "if 'pytest' in sys.argv:\n"
-        "    Path('arguments.json').write_text(json.dumps(sys.argv[1:]))\n"
+        "    Path('arguments.json').write_text(json.dumps(sys.argv[1:]))\n",
+        newline="\n",
+    )
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "# Copyright 2026 Israel Flores-Arbolay\n"
+        "# SPDX-License-Identifier: Apache-2.0\n"
+        'exec "$PICCOLO_OFFLINE_PYTHON" ' + shlex.quote(script.as_posix()) + ' "$@"\n',
+        newline="\n",
     )
     stub.chmod(0o700)
     environment = os.environ.copy()
+    environment["PICCOLO_OFFLINE_PYTHON"] = Path(sys.executable).as_posix()
     environment["PATH"] = str(binary) + os.pathsep + environment["PATH"]
     environment["PICCOLO_GCP_LIVE_PROJECT"] = TEST_PROJECT
     environment["PICCOLO_GCP_LIVE_APPROVAL_SHA256"] = "offline-review"
+    environment["PICCOLO_GCP_LIVE_BUDGET_FILE"] = "offline-spending-ledger.json"
     profile_path = "approved profile $(touch unexpected-file).toml"
     selection = "credential_guards or shutdown_metadata"
     result = subprocess.run(
@@ -917,9 +937,9 @@ def test_live_recipe_preserves_pytest_argument_boundaries(tmp_path: Path) -> Non
             str(Path("justfile").resolve()),
             "--working-directory",
             str(tmp_path),
-            "test-gcp-live",
+            recipe,
             profile_path,
-            "tests/test_gcp_live.py",
+            suite,
             "-k",
             selection,
             "--maxfail=1",
@@ -932,7 +952,11 @@ def test_live_recipe_preserves_pytest_argument_boundaries(tmp_path: Path) -> Non
     )
     assert result.returncode == 0, result.stderr
     arguments: list[str] = json.loads((tmp_path / "arguments.json").read_text())
-    assert arguments[-4:] == ["tests/test_gcp_live.py", "-k", selection, "--maxfail=1"]
+    assert arguments[-4:] == [suite, "-k", selection, "--maxfail=1"]
+    assert option in arguments
+    assert (
+        "--gcp-win-live" if option == "--gcp-live" else "--gcp-live"
+    ) not in arguments
     assert not (tmp_path / "unexpected-file").exists()
 
 

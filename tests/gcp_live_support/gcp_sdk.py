@@ -7,7 +7,8 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import override
 
@@ -26,7 +27,26 @@ from piccolo.providers.gcp.operations import failure
 from piccolo.providers.gcp.provider import GCPProvider
 from piccolo.providers.gcp.provision import labels
 from piccolo.providers.gcp.resources import READ_RETRY, SDKCloud
+from piccolo.state.lock import file_lock
 from piccolo.state.storage import private_file
+
+
+@contextmanager
+def budget_lock(path: Path) -> Generator[None]:
+    """Wait within the approved deadline for a portable private budget lock."""
+    while True:
+        lock = file_lock(path.with_name(path.name + ".lock"))
+        try:
+            lock.__enter__()
+            break
+        except PiccoloError as exc:
+            if "Another Piccolo process" not in str(exc):
+                raise
+            time.sleep(timeout(0.1))
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
 
 
 class LiveCloud(SDKCloud):
@@ -445,15 +465,10 @@ class LiveCloud(SDKCloud):
                 charge = 20_000
         if not charge:
             return
-        import fcntl
-
-        with os.fdopen(private_file(Path(path)), "r+") as stream:
-            while True:
-                try:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    time.sleep(timeout(0.1))
+        with (
+            budget_lock(Path(path)),
+            os.fdopen(private_file(Path(path)), "r+") as stream,
+        ):
             ledger = decode(stream.read())
             reservations = document(ledger["reservations"])
             if request_id in reservations:

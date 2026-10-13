@@ -52,7 +52,7 @@ def test_scp_retries_key_propagation_before_transfer(
         ]
     )
     monkeypatch.setattr(connection, "run", run)
-    monkeypatch.setattr("piccolo.providers.gcp.connection.time.sleep", Mock())
+    monkeypatch.setattr("piccolo.providers.gcp.ssh.time.sleep", Mock())
     connection.copy("us-west1-a", tmp_path / "source", "destination")
     assert run.call_count == 2
     assert run.call_args_list[0].args == run.call_args_list[1].args
@@ -182,9 +182,7 @@ def test_readiness_retries_then_succeeds(
 ) -> None:
     connection = GCloudConnection(config.gcp)
     monkeypatch.setattr(connection, "check_identity", lambda: None)
-    monkeypatch.setattr(
-        "piccolo.providers.gcp.connection.time.sleep", lambda _delay: None
-    )
+    monkeypatch.setattr("piccolo.providers.gcp.ssh.time.sleep", lambda _delay: None)
     mocked = Mock(
         side_effect=[
             subprocess.CompletedProcess([], 255, "", "Connection refused"),

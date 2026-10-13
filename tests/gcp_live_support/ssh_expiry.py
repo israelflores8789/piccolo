@@ -4,6 +4,7 @@
 """ssh_expiry.py — Disposable SSH keys and observed expiration/reconnect evidence."""
 
 import hashlib
+import os
 import shlex
 import subprocess
 import time
@@ -17,8 +18,10 @@ from gcp_live_support.manifest import Manifest, gate
 from piccolo.config import Config
 from piccolo.data import Document, decode, document, objects, text
 from piccolo.errors import PiccoloError
+from piccolo.process import run_command
 from piccolo.providers.gcp.connection import GCloudConnection
 from piccolo.providers.gcp.provision import zone_of
+from piccolo.state.storage import private_directory, private_file
 
 INITIAL_TTL = "45s"
 RENEWED_TTL = "5m"
@@ -177,6 +180,16 @@ class ExpiryConnection(GCloudConnection):
             self.checked_target,
             self.cloud.host_keys,
         )
+        self.key_file = Path(text(entry, "public_key_path")).with_suffix("")
+
+    @override
+    def before_ssh(self, zone: str) -> None:
+        """Journal native registration against the disposable key before any write."""
+        self.checked_target(zone)
+        validate_key_record(self.provider.config, self.manifest, self.entry)
+        self.entry["status"] = "publishing"
+        self.manifest.put("ssh_keys", self.entry)
+        super().before_ssh(zone)
 
     def checked_target(self, zone: str) -> Document:
         """Reject replaced or foreign VMs before any test-key publication or probe."""
@@ -234,11 +247,17 @@ class SSHExpiryProbe:
         self.zone = zone_of(instance)
         run = text(self.manifest.data, "run")
         directory = self.manifest.directory / f"ssh-expiry-{mode}-{transport}"
-        directory.mkdir(mode=0o700)
+        private_directory(directory)
         key = directory / "key"
+        keygen = (
+            provider.connection.ssh.executable("ssh-keygen")
+            if isinstance(provider.connection, GCloudConnection)
+            and provider.connection.windows
+            else "ssh-keygen"
+        )
         result = subprocess.run(
             [
-                "ssh-keygen",
+                keygen,
                 "-q",
                 "-t",
                 "ed25519",
@@ -260,7 +279,8 @@ class SSHExpiryProbe:
                 f"Cannot create disposable SSH test key: {result.stderr}"
             )
         public = key.with_suffix(".pub")
-        public.chmod(0o600)
+        os.close(private_file(public))
+        os.close(private_file(key))
         self.entry: Document = {
             "key": f"ssh-key:{run}:{mode}:{transport}",
             "mode": mode,
@@ -323,10 +343,14 @@ class SSHExpiryProbe:
                 *self.connection.flags(),
             ]
         )
+        if self.connection.windows:
+            proxy = self.connection.ssh.proxy_command(self.zone)
         return [
-            "ssh",
+            self.connection.ssh.executable("ssh") if self.connection.windows else "ssh",
             "-F",
-            "/dev/null",
+            str(self.connection.empty_config)
+            if self.connection.windows
+            else "/dev/null",
             "-i",
             str(Path(text(self.entry, "public_key_path")).with_suffix("")),
             "-oBatchMode=yes",
@@ -336,13 +360,17 @@ class SSHExpiryProbe:
             "-oPasswordAuthentication=no",
             "-oKbdInteractiveAuthentication=no",
             "-oStrictHostKeyChecking=yes",
-            "-oGlobalKnownHostsFile=/dev/null",
+            (
+                f'-oGlobalKnownHostsFile="{self.connection.empty_config.as_posix()}"'
+                if self.connection.windows
+                else "-oGlobalKnownHostsFile=/dev/null"
+            ),
             "-oKnownHostsCommand=none",
             "-oVerifyHostKeyDNS=no",
             "-oCheckHostIP=no",
             "-oConnectTimeout=10",
             "-oConnectionAttempts=1",
-            f"-oUserKnownHostsFile={self.connection.known_hosts}",
+            f'-oUserKnownHostsFile="{self.connection.known_hosts.as_posix()}"',
             f"-oHostKeyAlias=compute.{text(self.entry, 'instance_id')}",
             f"-oProxyCommand={proxy}",
             f"{self.provider.gcp.ssh_user}@compute.{text(self.entry, 'instance_id')}",
@@ -351,6 +379,12 @@ class SSHExpiryProbe:
 
     def native(self, command: str) -> subprocess.CompletedProcess[str]:
         """Authenticate only with the disposable key and enrolled host trust."""
+        if self.connection.windows:
+            return run_command(
+                self.native_arguments(command),
+                self.connection.environment(),
+                timeout=timeout(),
+            )
         return subprocess.run(
             self.native_arguments(command),
             shell=False,
@@ -428,7 +462,7 @@ class SSHExpiryProbe:
                 raise PiccoloError("Piccolo SSH failed to reconnect after expiration")
         else:
             source = Path(text(self.entry, "public_key_path")).parent / "probe.txt"
-            source.write_text("piccolo expiry transfer\n")
+            source.write_text("piccolo expiry transfer\n", newline="\n")
             source.chmod(0o600)
             self.connection.copy(self.zone, source, self.remote_path)
             verify = self.native(f"cat ~/{self.remote_path}")

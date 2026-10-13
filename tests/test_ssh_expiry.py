@@ -171,7 +171,7 @@ def test_expiration_oracle_and_reconnect_order(
     probe = ssh_expiry.SSHExpiryProbe(provider, mode, transport)
     clock = Clock()
     monkeypatch.setattr(ssh_expiry, "time", clock)
-    monkeypatch.setattr("piccolo.providers.gcp.connection.time", clock)
+    monkeypatch.setattr("piccolo.providers.gcp.ssh.time", clock)
     profile: Document = {}
     expiry = [0.0]
     commands: list[list[str]] = []
