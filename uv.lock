@@ -895,7 +895,6 @@ wheels = [
 
 [[package]]
 name = "piccolo-stack"
-version = "0.1.0a1"
 source = { editable = "." }
 dependencies = [
     { name = "annotated-doc" },

@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["hatchling==1.32.4", "packaging==26.3", "pathspec==1.1.1", "pluggy==1.6.0", "trove-classifiers==2026.9.21.13", "tomlkit==0.15.1"]
+requires = ["hatchling==1.32.4", "hatch-vcs==0.5.0", "packaging==26.3", "pathspec==1.1.1", "pluggy==1.6.0", "trove-classifiers==2026.9.21.13", "tomlkit==0.15.1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "piccolo-stack"
-version = "0.1.0a1"
+dynamic = ["version"]
 description = "Declarative infrastructure utility for GCP development environments"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -27,6 +27,11 @@ dependencies = [
 
 [project.scripts]
 piccolo = "piccolo.cli:main"
+
+[tool.hatch.version]
+source = "vcs"
+tag-pattern = '^v(?P<version>\d+\.\d+\.\d+.*)$'
+fallback-version = "0.1.0"
 
 # Transitive requirements are pinned as well so pip cannot select older runtime packages.
 [project.optional-dependencies]
