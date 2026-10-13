@@ -54,7 +54,7 @@ jobs:
         echo "Verified successful CI run $run_id for commit $TAG_SHA."
 
   prepare:
-    name: Verify, test, and build
+    name: Verify and build
     needs: verify-ci
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -123,15 +123,6 @@ jobs:
 
     - name: Install Python
       run: uv python install 3.12
-
-    - name: Sync environment
-      run: uv sync --locked --all-extras --dev --python 3.12
-
-    - name: Run test suite (pre-publish gate)
-      run: |
-        # CI was verified for this exact tag SHA above; re-run the
-        # hermetic suite so release preparation has its own local check.
-        uv run pytest -m "not gcp_live" -q
 
     - name: Build distributions
       run: uv build --out-dir dist/
