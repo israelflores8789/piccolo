@@ -3,13 +3,16 @@
 
 """test_windows_storage.py — Actual ACL creation, repair, replacement, and redirects."""
 
+import hashlib
 import os
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from platform_support import assert_private, redirect
 
+from piccolo.bootstrap.staging import upload
 from piccolo.config import Config
 from piccolo.errors import PiccoloError
 from piccolo.state.journal import Journal
@@ -147,3 +150,35 @@ def test_private_temporary_directory_cleans_on_exception() -> None:
         assert_private(directory / "artifact")
         raise RuntimeError("injected failure")
     assert path is not None and not path.exists()
+
+
+@pytest.mark.parametrize("fail_transfer", [True, False])
+def test_bootstrap_upload_snapshot_is_private_and_cleaned(
+    tmp_path: Path,
+    fail_transfer: bool,
+) -> None:
+    source = tmp_path / "source.sh"
+    contents = "#!/bin/bash\nprintf '\u00e9\\n'\n".encode()
+    source.write_bytes(contents)
+    digest = hashlib.sha256(contents).hexdigest()
+    snapshots: list[Path] = []
+
+    def transfer(_zone: str, artifact: Path, _destination: str) -> None:
+        snapshots.append(artifact)
+        assert_private(artifact.parent, directory=True)
+        assert_private(artifact)
+        assert artifact.read_bytes() == contents
+        if fail_transfer:
+            raise PiccoloError("fixture transfer rejected")
+
+    connection = Mock()
+    connection.copy.side_effect = transfer
+    connection.execute.return_value = digest
+    if fail_transfer:
+        with pytest.raises(PiccoloError, match="transfer rejected"):
+            upload(connection, "zone", source, ".piccolo/setup.upload", digest)
+    else:
+        upload(connection, "zone", source, ".piccolo/setup.upload", digest)
+    assert len(snapshots) == 1
+    assert not snapshots[0].parent.exists()
+    assert source.read_bytes() == contents

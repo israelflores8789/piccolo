@@ -21,6 +21,7 @@ from piccolo.errors import PiccoloError
 from piccolo.openssh import SSHSession
 from piccolo.process import run_command
 from piccolo.providers.gcp.connection import GCloudConnection
+from piccolo.state.journal import Journal
 
 
 @pytest.fixture
@@ -145,6 +146,52 @@ def test_native_transfer_rejects_path_before_authorization(
         native.copy("us-west1-a", Path("source"), "../escape")
     prepare.assert_not_called()
     assert native.deadline is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Native Windows artifact ACLs")
+def test_native_session_artifacts_remain_private_after_authorization_failure(
+    native: GCloudConnection,
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(native, "launcher", Mock(return_value=["offline-gcloud"]))
+    journal = Journal(config)
+    journal.begin({"kind": "init", "id": "fixture-operation"})
+    try:
+        native.ssh.native_session("us-west1-a")
+        original_key = native.key_file.read_bytes()
+        original_trust = native.known_hosts.read_bytes()
+        artifacts = [
+            native.key_file,
+            native.key_file.with_name(native.key_file.name + ".pub"),
+            native.known_hosts,
+            native.empty_config,
+            journal.path,
+        ]
+        for path in artifacts:
+            assert_private(path)
+        assert_private(native.known_hosts.parent, directory=True)
+        assert_private(Path(native.host_directory.name), directory=True)
+        monkeypatch.setattr(
+            native.ssh.authorization,
+            "authorize",
+            Mock(side_effect=PiccoloError("fixture authorization rejected")),
+        )
+        launch = Mock()
+        monkeypatch.setattr(native.ssh.client, "command", launch)
+        with pytest.raises(PiccoloError, match="authorization rejected"):
+            native.execute("us-west1-a", "true")
+        launch.assert_not_called()
+        assert native.deadline is None
+        assert native.key_file.read_bytes() == original_key
+        assert native.known_hosts.read_bytes() == original_trust
+        journal.update({"kind": "init", "id": "fixture-after-failure"})
+        assert Journal(config).operation["id"] == "fixture-after-failure"
+        for path in artifacts:
+            assert_private(path)
+    finally:
+        native.host_directory.cleanup()
+    assert not native.known_hosts.parent.exists()
 
 
 def test_native_shell_inherits_terminal_and_command_checks_user(

@@ -284,6 +284,7 @@ def test_api_uses_connection_token_and_never_adc(
         )
     )
     monkeypatch.setattr(subprocess, "run", subprocess_run)
+    monkeypatch.setattr("piccolo.providers.gcp.connection.run_command", subprocess_run)
     response = MagicMock()
     response.__enter__.return_value.read.return_value = b'{"id":"123"}'
     urlopen = Mock(return_value=response)

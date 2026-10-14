@@ -188,9 +188,13 @@ class GCloudConnection:
         try:
             if interactive and capture:
                 return self.interactive_invoke(arguments, environment, timeout=bounded)
-            if self.windows and arguments[:2] == ["compute", "start-iap-tunnel"]:
+            if self.windows:
                 return run_command(
-                    [*self.launcher(), *arguments, *self.flags()],
+                    [
+                        *self.launcher(),
+                        *arguments,
+                        *(self.flags() if use_flags else []),
+                    ],
                     environment,
                     timeout=bounded,
                     capture=capture,

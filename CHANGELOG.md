@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Contain all native Windows gcloud helper processes in cleanup jobs so timeouts and interruption terminate descendants as well as SSH/IAP processes. Resolves M01 of the 2026-10-13 security audit.
 - Replace selector-based pipe capture with bounded reader-thread capture and preserve foreground terminal handles.
 - Create private journal replacements and upload files before writing their contents; generate bootstrap runners with LF endings on Windows.
 - Preserve pytest argument boundaries and make live spending-ledger locking portable without running live tests.
