@@ -302,6 +302,31 @@ def test_preparation_deadline_prevents_launch_and_restores_outer_state(
     launch.assert_not_called()
 
 
+def test_native_readiness_allows_preparation_within_configured_deadline(
+    native: GCloudConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep helper preparation from exhausting a short network-probe allowance."""
+    monkeypatch.setattr(native, "check_identity", Mock())
+    probe = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(native.ssh, "native_result", probe)
+    native.ready("us-west1-a")
+    assert 40 < probe.call_args.kwargs["timeout"] <= native.config.readiness_timeout
+
+
+@pytest.mark.parametrize("status", [0, 130, 42, 255])
+def test_interactive_shell_accepts_ctrl_c_but_retains_session_errors(
+    native: GCloudConnection, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Treat an interrupted final guest command as a normal interactive exit."""
+    result = subprocess.CompletedProcess([], status, "", "")
+    monkeypatch.setattr(native.ssh, "native_result", Mock(return_value=result))
+    if status in {0, 130}:
+        native.shell("us-west1-a")
+    else:
+        with pytest.raises(PiccoloError, match="SSH session exited"):
+            native.shell("us-west1-a")
+
+
 @pytest.mark.skipif(
     sys.platform != "win32", reason="Actual native ProxyCommand parsing"
 )

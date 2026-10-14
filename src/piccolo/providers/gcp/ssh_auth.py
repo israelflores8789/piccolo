@@ -9,7 +9,8 @@ import json
 import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -94,15 +95,33 @@ class KeyAuthorization:
     def __init__(self, connection: SSHHost) -> None:
         """Use only the inspected, explicitly selected gcloud connection facade."""
         self.connection = connection
+        self._cache_token = False
+        self._token: tuple[tuple[str, ...], str] | None = None
+
+    @contextmanager
+    def session(self) -> Generator[None]:
+        """Reuse a connector token only within one bounded native operation."""
+        previous = self._cache_token, self._token
+        self._cache_token, self._token = True, None
+        try:
+            yield
+        finally:
+            self._cache_token, self._token = previous
 
     def request(self, path: str, body: Document | None = None) -> Document:
         """Call fixed Google Compute endpoints with a connection-identity token."""
-        result = self.connection.run(["auth", "print-access-token"], timeout=30)
-        token = result.stdout.strip()
-        if result.returncode or not token or any(c.isspace() for c in token):
-            raise PiccoloError(
-                "Cannot obtain the selected gcloud connection access token"
-            )
+        identity = tuple(self.connection.flags())
+        if self._cache_token and self._token is not None and self._token[0] == identity:
+            token = self._token[1]
+        else:
+            result = self.connection.run(["auth", "print-access-token"], timeout=30)
+            token = result.stdout.strip()
+            if result.returncode or not token or any(c.isspace() for c in token):
+                raise PiccoloError(
+                    "Cannot obtain the selected gcloud connection access token"
+                )
+            if self._cache_token:
+                self._token = identity, token
         remember_secrets({"access_token": token})
         request = Request(
             "https://compute.googleapis.com/compute/v1/" + path,
@@ -303,6 +322,7 @@ class KeyAuthorization:
             for entry in objects(profile, "posixAccounts")
             if entry.get("primary") is True
             and entry.get("operatingSystemType", "LINUX") == "LINUX"
+            and text(entry, "accountId") in {"", self.connection.config.project_id}
         ]
         if (
             len(accounts) != 1
@@ -313,6 +333,20 @@ class KeyAuthorization:
                 "identity's primary POSIX username"
             )
         self.instance(zone, identity)
+        material = " ".join(public_key.split()[:2])
+        matching = [
+            document(raw)
+            for raw in document(profile.get("sshPublicKeys", {})).values()
+            if " ".join(text(document(raw), "key").split()[:2]) == material
+        ]
+        if len(matching) == 1:
+            stamp = str(matching[0].get("expirationTimeUsec", ""))
+            if stamp.isdecimal():
+                expires = int(stamp) / 1_000_000
+                seconds = duration(self.connection.config.expire_after)
+                now = time.time()
+                if now + min(60, seconds / 2) < expires <= now + seconds + 1:
+                    return
         result = self.connection.run(
             [
                 "compute",

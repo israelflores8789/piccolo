@@ -95,7 +95,7 @@ def scenario(
         return document(instance if kind == "instance" else disk)
 
     monkeypatch.setattr(cloud, "get", get)
-    monkeypatch.setattr(cloud, "connection_policy", lambda _instance: None)
+    monkeypatch.setattr(cloud, "connection_policy", Mock(return_value=None))
 
     def set_metadata(zone: str, instance_id: str, items: list[Document]) -> None:
         assert zone == ZONE and instance_id == "123"
@@ -105,8 +105,8 @@ def scenario(
         }
 
     monkeypatch.setattr(cloud, "set_metadata", set_metadata)
-    monkeypatch.setattr(GCloudConnection, "environment", lambda _self: {})
-    monkeypatch.setattr(GCloudConnection, "launcher", lambda _self: ["gcloud"])
+    monkeypatch.setattr(GCloudConnection, "environment", Mock(return_value={}))
+    monkeypatch.setattr(GCloudConnection, "launcher", Mock(return_value=["gcloud"]))
     monkeypatch.setattr(
         GCloudConnection,
         "run",
@@ -191,7 +191,9 @@ def test_expiration_oracle_and_reconnect_order(
             f"--ssh-key-file={private_key}",
         ]
         assert flags[0] in args and flags[1] in args
-        expiry[0] = clock.now + (45 if _self.config.expire_after == "45s" else 300)
+        from piccolo.providers.gcp.ssh_auth import duration
+
+        expiry[0] = clock.now + duration(_self.config.expire_after)
         public = text(probe.entry, "public_key")
         if mode == "oslogin":
             profile["sshPublicKeys"] = {
@@ -423,9 +425,7 @@ def test_reconnect_requires_same_key_and_later_expiration(
     monkeypatch.setattr(ssh_expiry, "time", Clock())
     probe.entry["status"] = "expired-and-rejected"
     manifest.put("ssh_keys", probe.entry)
-    monkeypatch.setattr(
-        probe.connection, "execute", lambda _zone, _command: "reconnected"
-    )
+    monkeypatch.setattr(probe.connection, "execute", Mock(return_value="reconnected"))
     monkeypatch.setattr(probe, "authorization", lambda: observation)
     with pytest.raises(PiccoloError, match="renew the same"):
         probe.reconnect(("own", 900.0))

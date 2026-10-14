@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file. The format 
 
 - Native Windows OpenSSH transport with explicit expiring metadata/OS Login authorization, immutable host trust, protected shared-key preparation, and binary IAP proxy execution.
 - Pywin32-backed private Windows storage, handle-based ownership and DACL verification, safe file-descriptor transfer, and job-based connection process-tree cleanup.
-- Native Windows offline ACL, key, locking, proxy, and process tests; Linux/Windows/macOS local CI on Python 3.12 and 3.14; separately selectable `gcp_win_live` tests that remain unrun in this implementation.
+- Native Windows offline ACL, key, locking, proxy, and process tests; Linux/Windows/macOS local CI on Python 3.12 and 3.14; separately selectable `gcp_win_live` transport, lifecycle, impersonation, and recovery checks with bounded terminal acceptance.
 
 ### Changed
 
@@ -25,6 +25,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Fixed
 
+- Preserve the human gcloud connector in the Windows live harness, independently of provisioner SDK credentials and the attached guest service account.
+- Select the configured project's primary OS Login account; reuse connector tokens only within bounded native operations and allow readiness preparation to use its configured deadline.
+- Protect temporary human impersonation credentials with native private storage and allow Windows disposable-key probes enough initial lifetime for SDK preparation.
+- Restore mutated live bootstrap fixtures byte-for-byte so Windows newline translation cannot change the staged script digest.
+- Stop the Windows IAP SDK proxy on OpenSSH input closure, preserve binary bytes and genuine transport errors, and accept interactive Ctrl+C exit status 130.
+- Reuse an existing OS Login key only while its finite remaining lifetime satisfies the configured expiration policy.
+- Derive live-session test account and dummy-secret identities from the explicitly approved project environment variable; use a project-specific baseline path without a default project.
 - Contain all native Windows gcloud helper processes in cleanup jobs so timeouts and interruption terminate descendants as well as SSH/IAP processes. Resolves M01 of the 2026-10-13 security audit.
 - Replace selector-based pipe capture with bounded reader-thread capture and preserve foreground terminal handles.
 - Create private journal replacements and upload files before writing their contents; generate bootstrap runners with LF endings on Windows.

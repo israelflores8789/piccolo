@@ -4,6 +4,9 @@
 """gcp_live.py — Offline profile validation and independently invocable janitor.
 
 Set PICCOLO_GCP_LIVE_PROJECT to match the live profile and recovery manifest.
+Project-qualified identities use the validated profile project, which must
+exactly match that environment variable. The human connection-account policy
+applies to every live profile, not just the separate SDK impersonation test.
 """
 
 import argparse

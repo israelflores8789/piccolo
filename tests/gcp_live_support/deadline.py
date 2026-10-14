@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from piccolo.providers.gcp.ssh import SSHTransport
 
 TOTAL_SECONDS = 45 * 60
-MAX_SECONDS = 105 * 60
+MAX_SECONDS = 145 * 60
 CLEANUP_SECONDS = 5 * 60
 INVENTORY_SECONDS = 60
 SERVICE_USAGE_INTERVAL = 1.05
@@ -50,7 +50,7 @@ class Deadline:
         self.clock = clock
         if not CLEANUP_SECONDS < total_seconds <= MAX_SECONDS:
             raise PiccoloError(
-                "Live duration must exceed cleanup reserve and be at most 6300 seconds"
+                "Live duration must exceed cleanup reserve and be at most 8700 seconds"
             )
         self.total_seconds = total_seconds
         self.started = clock()
@@ -293,7 +293,7 @@ def live_session() -> Generator[Deadline]:
     ) -> subprocess.CompletedProcess[str]:
         """Bound native preparation, REST authorization, and SSH by the live phase."""
         current = ACTIVE.get()
-        seconds = min(30.0, float(timeout) if timeout is not None else 30.0)
+        seconds = float(timeout) if timeout is not None else 120.0
         if current is not None:
             seconds = min(seconds, current.remaining())
         if seconds < 1:
@@ -332,5 +332,5 @@ def duration_seconds() -> int:
     except ValueError as exc:
         raise PiccoloError("PICCOLO_GCP_LIVE_SECONDS must be an integer") from exc
     if not CLEANUP_SECONDS < seconds <= MAX_SECONDS:
-        raise PiccoloError("Live duration must be between 301 and 6300 seconds")
+        raise PiccoloError("Live duration must be between 301 and 8700 seconds")
     return seconds

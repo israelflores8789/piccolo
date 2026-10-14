@@ -176,7 +176,11 @@ class ExpiryConnection(GCloudConnection):
         self.entry = entry
         self.manifest = self.cloud.manifest
         super().__init__(
-            replace(provider.gcp, expire_after=INITIAL_TTL, require_passphrase=False),
+            replace(
+                provider.gcp,
+                expire_after="2m" if os.name == "nt" else INITIAL_TTL,
+                require_passphrase=False,
+            ),
             self.checked_target,
             self.cloud.host_keys,
         )

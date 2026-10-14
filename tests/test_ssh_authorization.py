@@ -7,6 +7,7 @@ import copy
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from unittest.mock import MagicMock, Mock
 from urllib.error import HTTPError
 
@@ -59,7 +60,7 @@ class MetadataAPI:
                     "https://compute.googleapis.com/",
                     412,
                     "fingerprint conflict",
-                    {},
+                    Message(),
                     None,
                 )
             assert (
@@ -264,6 +265,44 @@ def test_oslogin_identity_is_checked_before_import(
     assert not api.writes
 
 
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_oslogin_primary_accounts_are_scoped_to_the_selected_project(
+    authorization: tuple[KeyAuthorization, MetadataAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate: bool,
+) -> None:
+    """Ignore another project's primary entry and reject local ambiguity."""
+    import subprocess
+
+    auth, _api = authorization
+    account = {
+        "username": auth.connection.config.ssh_user,
+        "primary": True,
+        "accountId": auth.connection.config.project_id,
+    }
+    profile = {
+        "posixAccounts": [
+            {**account, "accountId": "another-project", "username": "other-user"},
+            account,
+            *([account] if duplicate else []),
+        ]
+    }
+    runner = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(profile), ""),
+            subprocess.CompletedProcess([], 0, "{}", ""),
+        ]
+    )
+    monkeypatch.setattr(auth.connection, "run", runner)
+    if duplicate:
+        with pytest.raises(PiccoloError, match="OS Login user mismatch"):
+            auth.oslogin("us-west1-a", "123", PUBLIC)
+        assert runner.call_count == 1
+    else:
+        auth.oslogin("us-west1-a", "123", PUBLIC)
+        assert runner.call_count == 2
+
+
 def test_api_uses_connection_token_and_never_adc(
     config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -302,3 +341,80 @@ def test_api_uses_connection_token_and_never_adc(
         request.full_url
         == "https://compute.googleapis.com/compute/v1/projects/test-project"
     )
+
+
+def test_connector_token_reuse_is_bounded_and_identity_scoped(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse one token per operation and refresh after identity changes or errors."""
+    import subprocess
+
+    connection = GCloudConnection(config.gcp)
+    connection.selected_account = "connector@example.test"
+    runner = Mock(return_value=subprocess.CompletedProcess([], 0, "fixture-token", ""))
+    monkeypatch.setattr(connection, "run", runner)
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = b'{"id":"123"}'
+    monkeypatch.setattr(
+        "piccolo.providers.gcp.ssh_auth.urlopen", Mock(return_value=response)
+    )
+    auth = connection.ssh.authorization
+    with (
+        pytest.raises(PiccoloError, match="fixture interruption"),
+        connection.ssh.bounded(60),
+    ):
+        auth.request("projects/test-project")
+        auth.request("projects/test-project")
+        assert runner.call_count == 1
+        connection.selected_account = "changed@example.test"
+        auth.request("projects/test-project")
+        assert runner.call_count == 2
+        raise PiccoloError("fixture interruption")
+    with connection.ssh.bounded(60):
+        auth.request("projects/test-project")
+        assert runner.call_count == 3
+    auth.request("projects/test-project")
+    auth.request("projects/test-project")
+    assert runner.call_count == 5
+
+
+@pytest.mark.parametrize(
+    "condition", ["valid", "expired", "unbounded", "overlong", "different", "duplicate"]
+)
+def test_oslogin_reuses_only_one_matching_key_with_a_bounded_valid_expiry(
+    authorization: tuple[KeyAuthorization, MetadataAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    condition: str,
+) -> None:
+    """Avoid redundant imports while renewing expired or excessive authorizations."""
+    import subprocess
+
+    auth, _api = authorization
+    monkeypatch.setattr("piccolo.providers.gcp.ssh_auth.time.time", lambda: 1000.0)
+    expiration = {
+        "expired": 999,
+        "unbounded": 0,
+        "overlong": 1000 + 2 * 86400,
+    }.get(condition, 4600)
+    key = {
+        "key": "ssh-ed25519 other-key comment" if condition == "different" else PUBLIC,
+        "expirationTimeUsec": str(expiration * 1_000_000),
+    }
+    keys = {"first": key}
+    if condition == "duplicate":
+        keys["second"] = key
+    profile = {
+        "posixAccounts": [
+            {"primary": True, "username": auth.connection.config.ssh_user}
+        ],
+        "sshPublicKeys": keys,
+    }
+    runner = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(profile), ""),
+            subprocess.CompletedProcess([], 0, "{}", ""),
+        ]
+    )
+    monkeypatch.setattr(auth.connection, "run", runner)
+    auth.oslogin("us-west1-a", "123", PUBLIC)
+    assert runner.call_count == (1 if condition == "valid" else 2)

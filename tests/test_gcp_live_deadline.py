@@ -66,7 +66,7 @@ def test_explicit_duration_extension_preserves_anchor_and_changes_approval(
     with live_session() as deadline:
         assert deadline.started == started
         assert deadline.total_seconds == 3600
-    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", "6301")
+    monkeypatch.setenv("PICCOLO_GCP_LIVE_SECONDS", "8701")
     with pytest.raises(PiccoloError, match="duration"):
         approval_digest(config)
 
@@ -149,10 +149,12 @@ def test_transient_service_read_retry_rechecks_deadline(
     """Retry only selected idempotent reads without resetting the phase budget."""
     _, now = active_deadline
     method = Mock(side_effect=[exceptions.ServiceUnavailable("temporary"), "available"])
-    monkeypatch.setattr(
-        "gcp_live_support.deadline.time.sleep",
-        lambda delay: now.__setitem__(0, now[0] + delay),
-    )
+
+    def advance(delay: float) -> None:
+        """Advance the fixture clock for a bounded retry delay."""
+        now[0] += delay
+
+    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", advance)
     rpc = bounded_rpc(method, retry_service_read=True)
     now[0] = TOTAL_SECONDS - CLEANUP_SECONDS - 5
     assert rpc() == "available"
@@ -244,7 +246,7 @@ def test_only_service_usage_get_transport_retries_503(
     from google.cloud import service_usage_v1
 
     del active_deadline
-    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", lambda _: None)
+    monkeypatch.setattr("gcp_live_support.deadline.time.sleep", Mock(return_value=None))
     client = service_usage_v1.ServiceUsageClient(
         credentials=AnonymousCredentials(), transport="rest"
     )
@@ -357,7 +359,7 @@ def test_shorter_live_session_preserves_cleanup_reserve(
             assert deadline.remaining() == pytest.approx(400)
 
 
-@pytest.mark.parametrize("duration", ["0", "300", "6301", "-1", "invalid"])
+@pytest.mark.parametrize("duration", ["0", "300", "8701", "-1", "invalid"])
 def test_live_session_rejects_invalid_or_extended_duration(
     monkeypatch: pytest.MonkeyPatch, duration: str
 ) -> None:
@@ -422,8 +424,10 @@ def test_expired_cleanup_reports_unknowns_without_cloud_calls(
     assert cleanup(manifest, backend, apply=True)
     inventory.assert_not_called()
     report = document(manifest.data["residual_cost_exposure"])
-    assert len(report["unverified_inventory"]) == 7
-    assert "recoverable_snapshot" in report["unverified_inventory"]
+    inventory = report["unverified_inventory"]
+    assert isinstance(inventory, list)
+    assert len(inventory) == 7
+    assert "recoverable_snapshot" in inventory
     assert not manifest.data["complete"]
 
 

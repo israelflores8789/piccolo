@@ -49,7 +49,8 @@ class SSHTransport:
                 deadline if previous is None else min(previous, deadline)
             )
         try:
-            yield
+            with self.authorization.session():
+                yield
         finally:
             self.connection.deadline = previous
 
@@ -127,7 +128,7 @@ class SSHTransport:
             "22",
             f"--zone={zone}",
             "--listen-on-stdin",
-            "--verbosity=warning",
+            "--verbosity=error",
             "--quiet",
             *self.connection.flags(),
         ]
@@ -288,7 +289,7 @@ class SSHTransport:
             remaining = max(1, int(deadline - time.monotonic()))
             try:
                 result = (
-                    self.native_result(zone, "true", timeout=min(25, remaining))
+                    self.native_result(zone, "true", timeout=remaining)
                     if self.connection.windows
                     else self.connection.run(
                         self.connection.ssh_arguments(zone, "true"),
@@ -403,5 +404,5 @@ class SSHTransport:
                 self.connection.ssh_arguments(zone), timeout=None, capture=False
             )
         )
-        if result.returncode:
+        if result.returncode not in {0, 130}:
             raise PiccoloError(f"SSH session exited with status {result.returncode}")
