@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file. The format 
 - Native Windows OpenSSH transport with explicit expiring metadata/OS Login authorization, immutable host trust, protected shared-key preparation, and binary IAP proxy execution.
 - Pywin32-backed private Windows storage, handle-based ownership and DACL verification, safe file-descriptor transfer, and job-based connection process-tree cleanup.
 - Native Windows offline ACL, key, locking, proxy, and process tests; Linux/Windows/macOS local CI on Python 3.12 and 3.14; separately selectable `gcp_win_live` transport, lifecycle, impersonation, and recovery checks with bounded terminal acceptance.
+- Top-level `spinner` configuration in `piccolo.toml` and `config.schema.json`, supporting all built-in yaspin spinners with validated names and a default of `dots`.
 
 ### Changed
 
@@ -22,6 +23,7 @@ All notable changes to this project will be documented in this file. The format 
 - Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.
 - Centralize Cloud SDK configuration paths and prefer the Windows SDK's bundled interpreter when present; retain separate SDK and connection identities.
 - Extract shared GCP SSH behavior behind one transport interface and add `just test-local` with explicit live-test exclusions.
+- Centralize spinner selection, loading messages, and terminal detection in `config/spinner.py`; display progress during `status`, `plan`, and preparation for `connect` and `tunnel`, stopping before foreground SSH or tunnel sessions and disabling animation for redirected output.
 
 ### Fixed
 

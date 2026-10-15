@@ -94,6 +94,7 @@ class Config:
     path: Path
     environment: str
     provider: str
+    spinner: str
     gcp: GCP
     bootstrap: Bootstrap | None
     fingerprint: str

@@ -20,6 +20,7 @@ from piccolo.config.models import (
     privileged_role,
     settings_fingerprint,
 )
+from piccolo.config.spinner import DEFAULT_SPINNER, validate_spinner
 from piccolo.data import Document, Value, document
 from piccolo.errors import PiccoloError
 
@@ -119,6 +120,7 @@ def load(path: Path | None = None) -> Config:
     provider = root.string("provider", "gcp")
     if provider != "gcp":
         raise PiccoloError(f"provider: unsupported provider {provider!r}")
+    spinner = validate_spinner(root.string("spinner", DEFAULT_SPINNER))
     cloud = root.section("gcp")
     project = named(
         cloud.string("project_id"), "gcp.project_id", r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
@@ -293,6 +295,7 @@ def load(path: Path | None = None) -> Config:
         selected,
         environment,
         provider,
+        spinner,
         GCP(
             project,
             Auth(mode, credential_path, impersonate),
