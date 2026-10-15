@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
 ### Added
 
 - Native Windows OpenSSH transport with explicit expiring metadata/OS Login authorization, immutable host trust, protected shared-key preparation, and binary IAP proxy execution.
