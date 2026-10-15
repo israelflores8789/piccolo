@@ -5,11 +5,14 @@
 
 import base64
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import BinaryIO
 from unittest.mock import Mock
 
 import pytest
@@ -18,6 +21,7 @@ from google.auth.credentials import AnonymousCredentials
 from google.cloud import compute_v1
 from platform_support import guest_bash
 
+import piccolo.process as process_module
 from piccolo.config import Config
 from piccolo.data import Document, document, objects
 from piccolo.errors import PiccoloError
@@ -263,26 +267,51 @@ def test_ssh_user_mismatch_stops_readiness_immediately(
     assert '"$(id -un)" != researcher' in remote
 
 
-def test_interactive_timeout_returns_with_descendant_stdout_open(
-    config: Config, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("startup_delay", [0.0, 0.5], ids=["normal", "slow-startup"])
+def test_interactive_timeout_does_not_wait_for_stdout_eof(
+    config: Config, monkeypatch: pytest.MonkeyPatch, startup_delay: float
 ) -> None:
+    """Honor the timeout while a simulated inherited pipe still withholds EOF."""
     connection = GCloudConnection(replace(config.gcp, require_passphrase=True))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(connection, "launcher", lambda: ["ignored"])
     real_popen = subprocess.Popen
+    reader_started = threading.Event()
+    reader_finished = threading.Event()
+    release_stdout = threading.Event()
+    readers: list[threading.Thread] = []
 
-    def local_process(_args: list[str], **kwargs: object) -> subprocess.Popen[str]:
-        code = (
-            "import subprocess,sys,time; subprocess.Popen([sys.executable, "
-            "'-c', 'import time; time.sleep(0.5)']); time.sleep(10)"
-        )
+    def local_process(_args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Include startup latency without assuming a wall-clock completion bound."""
+        time.sleep(startup_delay)
+        code = "import time; time.sleep(10)"
         return real_popen([sys.executable, "-c", code], **kwargs)
 
+    def hold_stdout_open(
+        _stream: BinaryIO, chunks: queue.Queue[bytes | OSError | None]
+    ) -> None:
+        """Withhold EOF until cleanup, using a watchdog for blocking regressions."""
+        readers.append(threading.current_thread())
+        reader_started.set()
+        try:
+            release_stdout.wait(timeout=5)
+        finally:
+            reader_finished.set()
+            chunks.put(None)
+
     monkeypatch.setattr(subprocess, "Popen", local_process)
-    before = time.monotonic()
-    with pytest.raises(subprocess.TimeoutExpired):
-        connection.interactive_invoke(
-            ["compute", "ssh", "--command=true"], dict(os.environ), timeout=0.1
-        )
-    assert time.monotonic() - before < 0.4
+    monkeypatch.setattr(process_module, "read_chunks", hold_stdout_open)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as failure:
+            connection.interactive_invoke(
+                ["compute", "ssh", "--command=true"], dict(os.environ), timeout=0.1
+            )
+        assert failure.value.timeout == 0.1
+        assert reader_started.wait(timeout=5), "Stdout reader never started"
+        assert not reader_finished.is_set(), "Timeout waited for stdout EOF"
+    finally:
+        release_stdout.set()
+        for reader in readers:
+            reader.join(timeout=5)
+            assert not reader.is_alive(), "Stdout reader survived test cleanup"
