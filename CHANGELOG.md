@@ -9,6 +9,40 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
+### Added
+
+- Native Windows OpenSSH transport with explicit expiring metadata/OS Login authorization, immutable host trust, protected shared-key preparation, and binary IAP proxy execution.
+- Pywin32-backed private Windows storage, handle-based ownership and DACL verification, safe file-descriptor transfer, and job-based connection process-tree cleanup.
+- Native Windows offline ACL, key, locking, proxy, and process tests; Linux/Windows/macOS local CI on Python 3.12 and 3.14; separately selectable `gcp_win_live` transport, lifecycle, impersonation, and recovery checks with bounded terminal acceptance.
+- Top-level `spinner` configuration in `piccolo.toml` and `config.schema.json`, supporting all built-in yaspin spinners with validated names and a default of `dots`.
+
+### Changed
+
+- Rename `gcp.auth.credential_file` to `gcp.auth.credentials_file`; update existing TOML configurations to use the plural key.
+- Separate provider-neutral OpenSSH key, trust-file, command, and transfer mechanics from GCP authorization and session preparation; split state and Cloud SDK path ownership and rename the Win32 process helper.
+- Run shared OpenSSH regression tests independently of GCP, with actual local key preparation on each supported platform and separately selectable Windows-specific checks.
+- Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.
+- Centralize Cloud SDK configuration paths and prefer the Windows SDK's bundled interpreter when present; retain separate SDK and connection identities.
+- Extract shared GCP SSH behavior behind one transport interface.
+- Centralize spinner selection, loading messages, and terminal detection in `config/spinner.py`; display progress during `status`, `plan`, and preparation for `connect` and `tunnel`, stopping before foreground SSH or tunnel sessions and disabling animation for redirected output.
+
+### Fixed
+
+- Restore per-test CI summaries by removing pytest's default quiet mode and running CI through `just test`, which now explicitly excludes live tests.
+- Preserve the human gcloud connector in the Windows live harness, independently of provisioner SDK credentials and the attached guest service account.
+- Select the configured project's primary OS Login account; reuse connector tokens only within bounded native operations and allow readiness preparation to use its configured deadline.
+- Protect temporary human impersonation credentials with native private storage and allow Windows disposable-key probes enough initial lifetime for SDK preparation.
+- Restore mutated live bootstrap fixtures byte-for-byte so Windows newline translation cannot change the staged script digest.
+- Stop the Windows IAP SDK proxy on OpenSSH input closure, preserve binary bytes and genuine transport errors, and accept interactive Ctrl+C exit status 130.
+- Reuse an existing OS Login key only while its finite remaining lifetime satisfies the configured expiration policy.
+- Derive live-session test account and dummy-secret identities from the explicitly approved project environment variable; use a project-specific baseline path without a default project.
+- Contain all native Windows gcloud helper processes in cleanup jobs so timeouts and interruption terminate descendants as well as SSH/IAP processes. Resolves M01 of the 2026-10-13 security audit.
+- Replace selector-based pipe capture with bounded reader-thread capture and preserve foreground terminal handles.
+- Create private journal replacements and upload files before writing their contents; generate bootstrap runners with LF endings on Windows.
+- Preserve pytest argument boundaries and make live spending-ledger locking portable without running live tests.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

@@ -7,23 +7,55 @@ import os
 import shlex
 import shutil
 import subprocess
-from collections.abc import Generator
+import sys
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
 from gcp_live_support.deadline import Deadline, live_session
+from platform_support import guest_bash
 
 from piccolo.config import Config, load
+from piccolo.config.models import GCP
 from piccolo.data import Document, document, objects, text
 from piccolo.errors import PiccoloError, UncertainError
+from piccolo.providers.gcp.connection import GCloudConnection
 
 LIVE_DEADLINE = pytest.StashKey[Deadline]()
+
+
+@pytest.fixture(autouse=True)
+def gcloud_transport_backend(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retain POSIX gcloud regression tests; native transport has its own suite."""
+    if request.module.__name__ not in {
+        "test_connection",
+        "test_gcloud_connection",
+        "test_ssh_expiry",
+    }:
+        return
+    original = GCloudConnection.__init__
+
+    def initialise(
+        self: GCloudConnection,
+        config: GCP,
+        target: Callable[[str], Document] | None = None,
+        host_keys: Callable[[str], Document] | None = None,
+    ) -> None:
+        original(self, config, target, host_keys)
+        self.windows = False
+
+    monkeypatch.setattr(GCloudConnection, "__init__", initialise)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def live_deadline(request: pytest.FixtureRequest) -> Generator[None]:
     """Apply one cooperative deadline and transport bounds only for live runs."""
-    if not request.config.getoption("--gcp-live"):
+    if not (
+        request.config.getoption("--gcp-live")
+        or request.config.getoption("--gcp-win-live")
+    ):
         yield
         return
     with live_session() as deadline:
@@ -34,7 +66,11 @@ def live_deadline(request: pytest.FixtureRequest) -> Generator[None]:
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """Skip subsequent live tests before fixtures when the work deadline expires."""
-    if item.get_closest_marker("gcp_live") and item.config.getoption("--gcp-live"):
+    if (
+        item.get_closest_marker("gcp_live") or item.get_closest_marker("gcp_win_live")
+    ) and (
+        item.config.getoption("--gcp-live") or item.config.getoption("--gcp-win-live")
+    ):
         current = item.config.stash.get(LIVE_DEADLINE, None)
         if current is not None:
             try:
@@ -74,6 +110,12 @@ user = "researcher"
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
+        "--gcp-win-live",
+        action="store_true",
+        default=False,
+        help="Explicitly select the gated native Windows GCP suite",
+    )
+    parser.addoption(
         "--gcp-live",
         action="store_true",
         default=False,
@@ -84,6 +126,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
+    if config.getoption("--gcp-live") and config.getoption("--gcp-win-live"):
+        raise pytest.UsageError("Select --gcp-live or --gcp-win-live separately")
+    if not config.getoption("--gcp-win-live"):
+        for item in items:
+            if item.get_closest_marker("gcp_win_live"):
+                item.add_marker(
+                    pytest.mark.skip(reason="requires explicit --gcp-win-live")
+                )
     if not config.getoption("--gcp-live"):
         for item in items:
             if item.get_closest_marker("gcp_live"):
@@ -260,6 +310,16 @@ class FakeCloud:
 class GuestConnection:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
+        self.bash = guest_bash()
+        self.guest_home = str(directory)
+        if sys.platform == "win32":
+            converted = subprocess.run(
+                [str(Path(self.bash).with_name("cygpath.exe")), "-u", str(directory)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.guest_home = converted.stdout.strip()
         directory.mkdir(parents=True, exist_ok=True)
         self.commands: list[str] = []
         self.copies = 0
@@ -272,21 +332,29 @@ class GuestConnection:
             raise PiccoloError(f"SSH unavailable in {zone}")
 
     def execute(self, zone: str, command: str, timeout: int = 60) -> str:
+        if command == "command -v setsid >/dev/null" and sys.platform != "linux":
+            pytest.skip("Detached guest runner needs Linux setsid and /proc/self/fd")
         self.commands.append(command)
         if self.launch_failure and "nohup" in command:
             raise PiccoloError(f"Connection interrupted in {zone}")
-        guest_command = command.replace('"$HOME"', shlex.quote(str(self.directory)))
+        guest_command = command.replace('"$HOME"', shlex.quote(self.guest_home))
         result = subprocess.run(
-            ["bash", "-c", guest_command],
+            [self.bash, "-x", "-c", guest_command],
             cwd=self.directory,
             text=True,
             capture_output=True,
             check=False,
             timeout=timeout,
-            env={**os.environ, "HOME": str(self.directory)},
+            env={**os.environ, "HOME": self.guest_home},
         )
         if result.returncode:
-            raise PiccoloError(result.stderr.strip())
+            raise PiccoloError(
+                f"Local guest emulation failed in {zone} (exit {result.returncode})\n"
+                f"Shell: {self.bash}\n"
+                f"Command: {guest_command}\n"
+                f"stdout: {result.stdout.strip() or '<empty>'}\n"
+                f"stderr (Bash trace):\n{result.stderr.strip() or '<empty>'}"
+            )
         return result.stdout.strip()
 
     def copy(self, zone: str, source: Path, destination: str) -> None:

@@ -17,6 +17,8 @@ dependencies = [
     "colorama==0.4.6",
     "markdown-it-py==4.2.0",
     "mdurl==0.1.2",
+    "platformdirs==4.12.4",
+    "pywin32==312; sys_platform == 'win32'",
     "pygments==2.21.0",
     "rich==15.0.0",
     "shellingham==1.5.4",
@@ -82,7 +84,6 @@ dev = [
     "nh3==0.3.7",
     "nodeenv==1.11.0",
     "packaging==26.3",
-    "platformdirs==4.12.4",
     "pluggy==1.6.0",
     "pre-commit==4.6.2",
     "pyproject-hooks==1.3.3",
@@ -93,6 +94,7 @@ dev = [
 
     "python-discovery==1.6.2",
     "pywin32-ctypes==0.2.3; sys_platform == 'win32'",
+    "types-pywin32==312.0.0.20261006",
     "pyyaml==6.0.3",
     "readme-renderer==46.0",
     "requests-toolbelt==1.0.0",
@@ -142,8 +144,11 @@ min-severity = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
-markers = ["gcp_live: opt-in disposable-project GCP tests, excluded by default"]
+addopts = "--strict-markers"
+markers = [
+    "gcp_live: opt-in disposable-project POSIX GCP tests, excluded by default",
+    "gcp_win_live: opt-in native Windows GCP transport tests, excluded by default",
+]
 
 [tool.coverage.run]
 source = ["src/piccolo"]

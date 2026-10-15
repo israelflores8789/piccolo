@@ -21,11 +21,14 @@ from google.api_core import exceptions
 from piccolo.errors import PiccoloError
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from piccolo.providers.gcp.clients import Clients
     from piccolo.providers.gcp.connection import GCloudConnection
+    from piccolo.providers.gcp.ssh import SSHTransport
 
 TOTAL_SECONDS = 45 * 60
-MAX_SECONDS = 105 * 60
+MAX_SECONDS = 145 * 60
 CLEANUP_SECONDS = 5 * 60
 INVENTORY_SECONDS = 60
 SERVICE_USAGE_INTERVAL = 1.05
@@ -47,7 +50,7 @@ class Deadline:
         self.clock = clock
         if not CLEANUP_SECONDS < total_seconds <= MAX_SECONDS:
             raise PiccoloError(
-                "Live duration must exceed cleanup reserve and be at most 6300 seconds"
+                "Live duration must exceed cleanup reserve and be at most 8700 seconds"
             )
         self.total_seconds = total_seconds
         self.started = clock()
@@ -218,6 +221,8 @@ def live_session() -> Generator[Deadline]:
     from piccolo.providers.gcp.connection import GCloudConnection
 
     deadline = Deadline(total_seconds=duration_seconds())
+    from piccolo.providers.gcp.ssh import SSHTransport
+
     anchor = os.environ.get("PICCOLO_GCP_LIVE_STARTED_MONOTONIC")
     if anchor is not None:
         try:
@@ -234,6 +239,8 @@ def live_session() -> Generator[Deadline]:
     token = ACTIVE.set(deadline)
     original_run = GCloudConnection.run
     original_invoke = GCloudConnection.invoke
+    original_native = SSHTransport.native_result
+    original_native_copy = SSHTransport.native_copy
 
     def bounded_run(
         self: GCloudConnection,
@@ -276,10 +283,42 @@ def live_session() -> Generator[Deadline]:
             use_flags=use_flags,
         )
 
+    def bounded_native(
+        self: SSHTransport,
+        zone: str,
+        command: str | None,
+        *,
+        timeout: int | None = 60,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Bound native preparation, REST authorization, and SSH by the live phase."""
+        current = ACTIVE.get()
+        seconds = float(timeout) if timeout is not None else 120.0
+        if current is not None:
+            seconds = min(seconds, current.remaining())
+        if seconds < 1:
+            raise PiccoloError("Live transport deadline expired")
+        return original_native(
+            self, zone, command, timeout=int(seconds), capture=capture
+        )
+
+    def bounded_native_copy(
+        self: SSHTransport, zone: str, source: Path, destination: str
+    ) -> None:
+        """Keep native transfers within the same cumulative approval deadline."""
+        current = ACTIVE.get()
+        seconds = min(120.0, current.remaining()) if current is not None else 120.0
+        if seconds < 1:
+            raise PiccoloError("Live transport deadline expired")
+        with self.bounded(int(seconds)):
+            original_native_copy(self, zone, source, destination)
+
     try:
         with (
             patch.object(GCloudConnection, "run", bounded_run),
             patch.object(GCloudConnection, "invoke", bounded_invoke),
+            patch.object(SSHTransport, "native_result", bounded_native),
+            patch.object(SSHTransport, "native_copy", bounded_native_copy),
         ):
             yield deadline
     finally:
@@ -293,5 +332,5 @@ def duration_seconds() -> int:
     except ValueError as exc:
         raise PiccoloError("PICCOLO_GCP_LIVE_SECONDS must be an integer") from exc
     if not CLEANUP_SECONDS < seconds <= MAX_SECONDS:
-        raise PiccoloError("Live duration must be between 301 and 6300 seconds")
+        raise PiccoloError("Live duration must be between 301 and 8700 seconds")
     return seconds

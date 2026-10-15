@@ -19,7 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 
-Piccolo provisions and manages one development VM per TOML configuration. Google Cloud infrastructure uses Google's Python SDKs; SSH, script transfer, and IAP tunnels use `gcloud`. Python 3.12 or newer is required; this repository develops with Python 3.13.
+Piccolo provisions and manages one development VM per TOML configuration. Google Cloud infrastructure uses Google's Python SDKs. Linux/macOS SSH and file transfer use `gcloud`; native Windows uses Windows OpenSSH with explicit GCP key authorization. IAP tunnels and connection credentials use `gcloud` on all platforms. Python 3.12 or newer is required.
 
 Infrastructure provisioning, explicit project setup, and daily connections are separate commands. Piccolo treats bootstrap as an opaque, project-owned Bash script. It never interprets the script or manages containers, repositories, development tools, or credentials inside it.
 
@@ -30,7 +30,7 @@ pip install 'piccolo-stack[gcp]'
 piccolo --help
 ```
 
-Install the Google Cloud CLI and its SSH/SCP prerequisites for connection commands. Configure SDK ADC and the `gcloud` connection login independently. Piccolo does not log in, activate credential files in `gcloud`, or create service-account keys. This README is the operational source for cloud prerequisites, approval, and recovery. The live harness is implemented and remains unvalidated against GCP.
+Install the Google Cloud CLI and its SSH/SCP prerequisites for connection commands. Configure SDK ADC and the `gcloud` connection login independently. Piccolo does not log in, activate credential files in `gcloud`, or create service-account keys. This README is the operational source for cloud prerequisites, approval, and recovery. Native Windows live validation is a separate, opt-in task.
 
 For local development:
 
@@ -38,6 +38,18 @@ For local development:
 just install-dev
 just ci
 ```
+
+Shared OpenSSH mechanics live in `piccolo.openssh`; GCP authorization, host-key retrieval, address selection, and IAP setup remain in the GCP provider. State-root paths belong to `piccolo.state.paths`, Cloud SDK paths to `piccolo.providers.gcp.paths`, and Windows process containment to `piccolo.win32process`. Run the provider-independent client tests with `just test tests/test_openssh.py`, provider session tests with `just test tests/test_native_ssh.py`, and native ACL checks with `just test tests/test_windows_storage.py`. Platform-specific cases skip on other operating systems; `just test` excludes both live suites.
+
+### Native Windows
+
+Install the Windows OpenSSH Client optional feature, version 9.0 or newer, and the full Google Cloud CLI. Native Windows Python selects `ssh.exe`, `scp.exe`, and `ssh-keygen.exe` under the Windows system OpenSSH directory even when Git Bash tools appear first on PATH. Windows Terminal with Git Bash and PowerShell use the same native implementation. Python inside WSL uses the Linux implementation and Linux paths. Keep private state and keys on a local ACL-capable filesystem; network shares, junctions, reparse points, and multiply linked private files are refused.
+
+`piccolo connect` and `piccolo tunnel` retain their existing CLI. Native SSH inherits terminal input/output, requests a remote PTY, and isolates user/global SSH configuration through private internally generated files. The separate application tunnel remains a foreground localhost IAP tunnel. Windows SCP uses SFTP and requires the Linux guest's SFTP subsystem. The terminal theme/query exchange, resizing, Unicode, and interruption behavior still need the separately approved Windows Terminal/UsageBassoon acceptance exercise described in [WIN-PROPOSAL.md](WIN-PROPOSAL.md); offline process checks cannot establish those terminal properties.
+
+Piccolo reuses `%USERPROFILE%\.ssh\google_compute_engine`, repairs its current-user DACL before reuse, and creates a new RSA key only when both halves are absent. A missing public half can be recovered without replacing the private key; mismatched or broken pairs require deliberate operator repair. Existing `.ssh` directory permissions and unrelated configuration are not reset. A shared key lock coordinates Piccolo processes across environments and state-root overrides. Encrypted existing keys can use the native Windows SSH agent with the default BatchMode behavior. `require_passphrase = true` requires an encrypted key and an interactive terminal for prompts; Piccolo never supplies a passphrase on the command line.
+
+Native Windows registration uses only the selected gcloud connection identity. Instance metadata updates merge unrelated entries, require the current fingerprint, retry only rejected fingerprint conflicts, and attach the configured expiration. OS Login checks the primary POSIX username before importing a key with TTL; `gcp.ssh.user` must match it. OS Login certificate and two-factor modes are explicitly unsupported by this native transport. Guest-attribute host keys remain authenticated and bound to the immutable VM ID, with strict host-key checking. Google Cloud SDK paths follow `CLOUDSDK_CONFIG` or `%APPDATA%\gcloud` on Windows and `~/.config/gcloud` on POSIX; an empty override uses the platform default, and missing Windows APPDATA fails explicitly.
 
 ## Configure an environment
 
@@ -91,7 +103,7 @@ Bootstrap and credential-file paths resolve relative to the TOML file. `bootstra
 | Root | `schema_version = 1`, `provider = "gcp"`, required `environment` |
 | `bootstrap` (optional) | Required `script` and `execution_user`; `remote_path = ".piccolo/bootstrap/setup.sh"`, `timeout = 1800` seconds |
 | `gcp` | Required `project_id`; `enable_apis = false`, `operation_timeout = 600` seconds |
-| `gcp.auth` | `mode = "adc"`; `mode = "file"` requires `credential_file`; optional `impersonate_service_account` |
+| `gcp.auth` | `mode = "adc"`; `mode = "file"` requires `credentials_file`; optional `impersonate_service_account` |
 | `gcp.instance` | Required `name` and full `service_account` email; `machine_type = "n2-standard-4"` |
 | `gcp.placement` | Required nonempty ordered `zones`; `snapshot_location = "us"` |
 | `gcp.disk` | Required pinned `image` resource path; `size_gb = 30`, `type = "pd-standard"` |
@@ -196,7 +208,9 @@ The source remains stopped until the replacement passes authenticated SSH and an
 
 Exactly one VM is selected by daily commands. Source/replacement overlap is expected only inside the journaled move; unexpected same-name instances block further creation. Unsupported moves include extra disks, regional disks, local SSDs, GPU/reservation-bound or Spot VMs, complex/IPv6 networking, customer-managed encryption, resource policies, and other source settings the adapter cannot preserve. Existing static-IP reservations remain external resources; moves use new ephemeral addresses and do not migrate reserved addresses.
 
-Local state defaults to `~/.piccolo/PROJECT_ENVIRONMENT_HASH/state.json`; `PICCOLO_STATE_DIR` can override the root. Files use atomic replacement, flushes, and operation history. Piccolo validates ownership, rejects symlink paths and nonregular/multiply linked state files, and repairs owned POSIX directories/files to 0700/0600 before using them, including locks and retained live manifests. Private storage currently requires POSIX ownership/modes; Windows ACL verification is unsupported and state operations fail explicitly. Keep state on one durable workstation: local locks do not coordinate independent machines. Back up this directory; missing history blocks setup rather than authorizing it. Recovery hashes a canonical representation of effective parsed settings, including defaults and resolved file paths. Comments, whitespace, and table/key order do not change that hash; significant array order or actual setting changes do. Restore the original settings before resuming a changed operation. Journals from previous development behavior may be stale; there is no compatibility migration. If an operation is no longer queryable, preserve state and cloud resources for manual inspection.
+Local state uses platformdirs' user-state directory: `$XDG_STATE_HOME/piccolo` or `~/.local/state/piccolo` on Linux, `%LOCALAPPDATA%\piccolo` on Windows, and `~/Library/Application Support/piccolo` on macOS. `PICCOLO_STATE_DIR` overrides the root and must be nonempty. Environment and same-VM hashes identify journal directories and resource locks. Files use atomic replacement, flushes, and retained operation history. POSIX storage checks ownership and repairs private modes; Windows storage verifies opened handles, current-user ownership, protected DACLs, reparse attributes, and single-link regular files. Windows temporary/replacement files are private before their first write. Shared profile ancestors are checked without resetting their ACLs.
+
+Keep state on one durable workstation and back it up: local locks do not coordinate independent machines, and missing history blocks setup rather than authorizing it. Recovery hashes a canonical representation of effective parsed settings, including defaults and resolved file paths. Comments, whitespace, and table/key order do not change that hash; significant array order or actual setting changes do. Restore the original settings before resuming a changed operation. If an operation is no longer queryable, preserve state and cloud resources for manual inspection.
 
 `privacy.py` centralizes credential-field and sensitive-text redaction; `logger.py` centralizes console JSON, errors, and notifications. Diagnostics hide arbitrary metadata, descriptions, and label values. Journals omit source metadata/descriptions and scrub credential fields and messages; relocation rereads the live source to preserve its metadata without retaining a confidential copy locally. Baseline live inventories retain identifiers and statuses only. Credential JSON values are registered for later diagnostic redaction without being copied into state. Keep operator credentials outside the repository, preferably under an ignored `.credentials/` directory; common credential JSON, PEM, and key filenames are also ignored. Pattern-based redaction cannot recognize every unlabelled secret a project script might print.
 
@@ -223,7 +237,7 @@ The historical lean scripts and design transcript are reference material only an
 
 ## Development and packaging
 
-Runtime dependencies, their resolved transitive dependencies, development tools, coverage tools, and the isolated build backend requirements are pinned to exact versions in package metadata. Downstream pip installations receive the same runtime pins as the lock. Controlled recipes use `--locked` to reject a stale lock instead of silently selecting other versions; `just lock` explicitly refreshes lock metadata after an intentional version change. Pre-commit repositories use immutable commit revisions. Dependabot is configured for Python dependency and security updates; enable repository Dependabot alerts/security updates in GitHub and review grouped updates with the local checks. External gcloud, OpenSSH, guest packages, and container dependencies remain operator-managed. Current local validation covers Linux with Python 3.13; Python 3.12 and Windows compatibility have not been newly established by this remediation.
+Runtime dependencies, their resolved transitive dependencies, development tools, coverage tools, and the isolated build backend requirements are pinned to exact versions in package metadata. Downstream pip installations receive the same runtime pins as the lock. Controlled recipes use `--locked` to reject a stale lock instead of silently selecting other versions; `just lock` explicitly refreshes lock metadata after an intentional version change. Platformdirs is a runtime dependency; pywin32 installs only on native Windows, and its type stubs are development-only. Pre-commit repositories use immutable commit revisions. Dependabot is configured for Python dependency and security updates; enable repository Dependabot alerts/security updates in GitHub and review grouped updates with the local checks. External gcloud, OpenSSH, guest packages, and container dependencies remain operator-managed. CI runs local tests on Linux, Windows, and macOS with Python 3.12 and 3.14. Linux guest process-group and POSIX filesystem integration checks remain platform-specific; native Windows has actual ACL, locking, key, process, and proxy tests.
 
 Use `just --list` for recipes. `just install-dev` installs every dependency group and provider extra. `just ci` runs the offline pytest suite, Ruff checks/format verification, and Pyrefly. Tests use fake cloud adapters, anonymous SDK clients with mocked methods, temporary local guest directories, and independent local processes for locks. They do not call GCP or use the reference bootstrap. No live integration suite runs automatically.
 
@@ -237,7 +251,34 @@ just check-dist
 
 Hatchling builds a wheel containing runtime Python modules and required package/license metadata, plus an explicitly selected source distribution. Schema JSON, audits, examples, tests, and reference/design files do not ship in the wheel; schema and audit documents are also excluded from the selected source distribution. Clone the repository to inspect those materials. `just check-dist` builds both and validates their metadata with Twine. Publishing and GitHub release/push operations are reserved for the repository owner. Release notes follow Keep a Changelog in [CHANGELOG.md](CHANGELOG.md).
 
-Live behavior, IAM propagation, SSH key provisioning, cross-region capacity, and complete real-resource teardown still require the separately approved validation described below.
+Native Windows live behavior and terminal acceptance require the separately approved validation described below. Offline validation does not establish Windows provisioning, bootstrap, relocation, recovery, or terminal behavior against real GCP resources.
+
+### Windows test prerequisites
+
+Run Windows tests with native Windows Python and Git for Windows. Git's `usr\bin` directory must be on `PATH` so the test helpers can discover `cygpath.exe` and use the matching Git Bash executable. Having `bash.exe` on `PATH` alone is insufficient. This is a development/test prerequisite; using the installed Piccolo CLI from PowerShell does not require `cygpath`.
+
+For a standard Git for Windows installation, run the following in PowerShell to add the directory to your user `PATH` and update the current session. Adjust `$gitTools` if Git is installed elsewhere.
+
+```powershell
+$gitTools = 'C:\Program Files\Git\usr\bin'
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $gitTools) {
+    [Environment]::SetEnvironmentVariable(
+        'Path', "$gitTools;$userPath".TrimEnd(';'), 'User'
+    )
+}
+$env:Path = "$gitTools;$env:Path"
+Get-Command cygpath
+cygpath -u $env:USERPROFILE
+```
+
+`Get-Command` should resolve to the Git installation's `usr\bin\cygpath.exe`, and `cygpath` should print your home directory as a POSIX path. Restart Windows Terminal and any editor or Codex instance that launches tests so future sessions inherit the saved user `PATH`. The commands above update the current PowerShell session immediately. See Microsoft's [PowerShell environment-variable documentation](https://github.com/MicrosoftDocs/PowerShell-Docs/blob/main/reference/7.6/Microsoft.PowerShell.Core/About/about_Environment_Variables.md) for process and persistent environment scopes.
+
+### GCP Windows live selection
+
+The native Windows GCP suite is `tests/test_gcp_win_live.py`, marked `gcp_win_live` and selected with `--gcp-win-live` through `just test-gcp-win-live PROFILE`. It is excluded from `just test`, `just ci`, and CI, and cannot be combined with the POSIX `--gcp-live` selection. The same project approval digest, cumulative duration, spending ledger, manifests, and scoped janitor apply. The Windows recipe requires `PICCOLO_GCP_LIVE_BUDGET_FILE`; no live validation is authorized merely by installing Piccolo or selecting a marker.
+
+Automated GCP Windows cases use the explicitly logged-in `piccolo-test-provisioner` connection account, the approved existing test VM account, and disposable manifest-recorded keys. They cover SSH/SCP expiration and renewal in metadata and OS Login modes without reading or replacing the workstation's ordinary SSH key. Human-account terminal/theme acceptance needs separate explicit authorization and is not part of these automated cases. The Windows suite has been authored and checked offline but has not been run against GCP as part of this implementation.
 
 ## Gated live GCP tests
 
@@ -253,7 +294,7 @@ Set `PICCOLO_GCP_LIVE_PROJECT` and `PICCOLO_GCP_LIVE_APPROVAL_SHA256` in your sh
 
 Enable `serviceusage.googleapis.com`, `cloudresourcemanager.googleapis.com`, `compute.googleapis.com`, `iam.googleapis.com`, `secretmanager.googleapis.com`, `iamcredentials.googleapis.com`, `iap.googleapis.com`, and `oslogin.googleapis.com` out of band. The test adapter enables OS Login only on run-owned VMs; it preserves project metadata. Install local OpenSSH client tools (`ssh`, `scp`, and `ssh-keygen`) before running. The suite preserves API state, project metadata, networks, and existing resources; it fails for missing APIs instead of enabling/disabling them. Explicitly approved `gcp.iam.project_roles` are applied only to the fixture's guest service account. The manifest records the project and guest identities and each previously absent unconditional member before writing; teardown removes only those added members from freshly read policies with etags and verifies removal. Existing bindings and unrelated policy changes are preserved. The provisioner needs `resourcemanager.projects.getIamPolicy` and `resourcemanager.projects.setIamPolicy` when project roles are configured. Conditional-only access is rejected instead of widened. Disabled-API behavior remains an offline check. Ensure regional subnet coverage and sufficient quotas for temporary source/replacement overlap.
 
-SDK provisioning accepts direct provisioner credentials through ADC or `gcp.auth.credential_file`, or optional provisioner impersonation. Direct service-account keys need no self-impersonation grant. The separate read-only impersonation case loads the authorized human source from `PICCOLO_GCP_LIVE_HUMAN_ADC` (a human ADC JSON file, including one saved with impersonation), then exercises Piccolo's human-to-provisioner token path. That source needs `roles/iam.serviceAccountTokenCreator` on the provisioner. `GOOGLE_APPLICATION_CREDENTIALS` does not select the human `gcloud` account. Authenticate the human owner separately, specify its account and POSIX username, and unset connection credential/access-token/impersonation overrides. The runner rejects inherited access-token/impersonation overrides and configured `gcloud` impersonation. [Impersonation documentation](https://github.com/googleapis/google-auth-library-python/blob/main/docs/user-guide.rst).
+SDK provisioning accepts direct provisioner credentials through ADC or `gcp.auth.credentials_file`, or optional provisioner impersonation. Direct service-account keys need no self-impersonation grant. The separate read-only impersonation case loads the authorized human source from `PICCOLO_GCP_LIVE_HUMAN_ADC` (a human ADC JSON file, including one saved with impersonation), then exercises Piccolo's human-to-provisioner token path. That source needs `roles/iam.serviceAccountTokenCreator` on the provisioner. `GOOGLE_APPLICATION_CREDENTIALS` does not select the human `gcloud` account. Authenticate the human owner separately, specify its account and POSIX username, and unset connection credential/access-token/impersonation overrides. The runner rejects inherited access-token/impersonation overrides and configured `gcloud` impersonation. [Impersonation documentation](https://github.com/googleapis/google-auth-library-python/blob/main/docs/user-guide.rst).
 
 The provisioner needs instance/disk/snapshot lifecycle and operation reads, firewall create/get/list/delete, project/subnet reads and subnet use, service-account get/list/create/delete/getIamPolicy/setIamPolicy/testIamPermissions, Secret Manager create/get/list/delete/getIamPolicy/setIamPolicy, and Service Usage discovery/consumption. A practical disposable-project bundle is `roles/compute.instanceAdmin.v1`, `roles/compute.securityAdmin`, `roles/compute.viewer`, `roles/iam.serviceAccountAdmin`, `roles/secretmanager.admin`, and `roles/serviceusage.serviceUsageConsumer`, plus `resourcemanager.projects.get`. Provisioner and connector both need `roles/iam.serviceAccountUser` on the pre-existing VM account, configured out of band. The human owner needs effective IAP TCP forwarding and OS Login permissions. Account attachment's `iam.serviceAccounts.actAs` is separate from impersonation's Token Creator permission. [Service account access documentation](https://docs.cloud.google.com/iam/docs/manage-access-service-accounts).
 

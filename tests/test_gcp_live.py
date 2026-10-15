@@ -4,6 +4,12 @@
 """test_gcp_live.py — Explicitly opted-in real SDK lifecycle and human IAP checks.
 
 Set PICCOLO_GCP_LIVE_PROJECT to the approved TOML project before live tests.
+All project-qualified test account addresses use that validated project.
+The Windows fixture uses the same human gcloud connector as every live profile;
+the provisioner is selected independently through SDK credentials and the
+existing VM account is supplied by gcp.instance.service_account.
+The shared profile requires a human gcp.ssh.account for connections,
+independently of whether the SDK impersonation case is selected.
 The impersonation case also requires PICCOLO_GCP_LIVE_HUMAN_ADC.
 
 Before running, label every existing secret listed in gcp.iam.secrets with
@@ -21,11 +27,13 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Generator
+from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -53,7 +61,12 @@ from piccolo.errors import CapacityError, PiccoloError, UncertainError
 from piccolo.logger import emit, log
 from piccolo.privacy import sanitize_text
 
-pytestmark = pytest.mark.gcp_live
+pytestmark = [
+    pytest.mark.gcp_live,
+    pytest.mark.skipif(
+        sys.platform == "win32", reason="Native Windows live tests use --gcp-win-live"
+    ),
+]
 
 
 @pytest.fixture(
@@ -65,13 +78,16 @@ def gcp_run(
     isolated_state: None,
 ) -> Generator["GCPProvider"]:
     del isolated_state
-    if not request.config.getoption("--gcp-live"):
-        pytest.skip("requires --gcp-live")
+    gcp_win_live = request.config.getoption("--gcp-win-live")
+    if not (request.config.getoption("--gcp-live") or gcp_win_live):
+        pytest.skip("requires an explicit provider/platform live selection")
     gate(os.environ.get("PICCOLO_GCP_LIVE_PROJECT", ""))
     path = os.environ.get("PICCOLO_GCP_LIVE_CONFIG")
     if not path:
         pytest.fail("Set PICCOLO_GCP_LIVE_CONFIG to the approved local TOML profile")
     base = profile(Path(path))
+    if gcp_win_live and not os.environ.get("PICCOLO_GCP_LIVE_BUDGET_FILE"):
+        pytest.fail("Windows live tests require an explicitly reviewed spending ledger")
     if request.node.callspec.params.get("workflow") == "init" and (
         initial_zone := os.environ.get("PICCOLO_GCP_LIVE_INIT_ZONE")
     ):
@@ -92,7 +108,7 @@ def gcp_run(
                 ),
             ),
         )
-    local_preflight()
+    local_preflight(base)
     if not fixture_time_available():
         pytest.skip("Less than two minutes of work time remain for a new VM fixture")
     from gcp_live_support.gcp_sdk import LiveCloud
@@ -106,7 +122,13 @@ def gcp_run(
 
     run = f"plive-{uuid.uuid4().hex[:16]}"
     directory = Path(".test_runs").resolve() / run
-    config = run_config(base, directory, run, create_account=bool(request.param))
+    config = run_config(
+        base,
+        directory,
+        run,
+        create_account=bool(request.param),
+        bootstrap=bool(request.node.callspec.params.get("bootstrap", not gcp_win_live)),
+    )
     manifest = Manifest.create(
         directory / "manifest.json", config.path, run, project=config.gcp.project_id
     )
@@ -182,7 +204,9 @@ def test_human_source_provisioner_impersonation(tmp_path: Path) -> None:
     if source.get("type") != "authorized_user":
         pytest.fail("Human impersonation source must be authorized_user credentials")
     source_path = tmp_path / "human-source.json"
-    descriptor = os.open(source_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    from piccolo.state.storage import private_file
+
+    descriptor = private_file(source_path, create=True, exclusive=True)
     try:
         with os.fdopen(descriptor, "w") as stream:
             json.dump(source, stream)
@@ -191,7 +215,7 @@ def test_human_source_provisioner_impersonation(tmp_path: Path) -> None:
             auth=replace(
                 base.gcp.auth,
                 mode="file",
-                credential_file=source_path,
+                credentials_file=source_path,
                 impersonate_service_account=target,
             ),
         )
@@ -288,10 +312,9 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
         objects(instance, "service_accounts")[0]["email"]
         == provider.gcp.service_account
     )
-    assert (
-        "https://www.googleapis.com/auth/cloud-platform"
-        in objects(instance, "service_accounts")[0]["scopes"]
-    )
+    scopes = objects(instance, "service_accounts")[0]["scopes"]
+    assert isinstance(scopes, list)
+    assert "https://www.googleapis.com/auth/cloud-platform" in scopes
     assert not any(
         "startup" in text(i, "key")
         for i in objects(document(instance.get("metadata", {})), "items")
@@ -309,11 +332,11 @@ def test_sdk_lifecycle_bootstrap_and_cross_region_move(gcp_run: "GCPProvider") -
     assert document(provider.journal.data["bootstrap"]) == staged
     assert provider.config.bootstrap is not None
     script = provider.config.bootstrap.script
-    original = script.read_text()
-    script.write_text(original + "# changed content\n")
+    original = script.read_bytes()
+    script.write_bytes(original + b"# changed content\n")
     with pytest.raises(PiccoloError, match="changed"):
         provider.bootstrap(False, False)
-    script.write_text(original)
+    script.write_bytes(original)
     provider.bootstrap(False, False)
     assert connection.execute(zone, "wc -l < ~/piccolo-live-marker") == "1"
     with pytest.raises(PiccoloError, match="blocked"):
@@ -404,6 +427,7 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
     connection.ready(zone)
     verify_guest_secrets(provider, zone)
     process: subprocess.Popen[bytes] | None = None
+    containment = ExitStack()
     try:
         connection.execute(
             zone,
@@ -433,6 +457,10 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
             env=connection.environment(),
             start_new_session=os.name != "nt",
         )
+        if os.name == "nt":
+            from piccolo.win32process import process_job
+
+            containment.enter_context(process_job(process.pid))
         deadline = time.monotonic() + 90
         while True:
             check_work()
@@ -461,6 +489,7 @@ def test_human_iap_tunnel_and_interruption(gcp_run: "GCPProvider") -> None:
             else:
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=15)
+        containment.close()
         connection.execute(
             zone,
             "if test -f ~/piccolo-live-http/pid; then "
@@ -541,10 +570,12 @@ def test_live_credential_guards_before_guest_access(
                 auth_config = replace(provider.gcp.auth, impersonate_service_account="")
                 if source == "file":
                     auth_config = replace(
-                        auth_config, mode="file", credential_file=path
+                        auth_config, mode="file", credentials_file=path
                     )
                 else:
-                    auth_config = replace(auth_config, mode="adc", credential_file=None)
+                    auth_config = replace(
+                        auth_config, mode="adc", credentials_file=None
+                    )
                     injection.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(path))
                 changed = replace(
                     provider.config, gcp=replace(provider.gcp, auth=auth_config)
@@ -604,12 +635,11 @@ def test_live_later_fallback_recovery(
         failed_zone, accepted_zone = provider.gcp.zones[:2]
     original_submit, original_poll = cloud.submit, cloud.poll
     original_created = provider.created
-    accepted_operation = ""
+    accepted_operation = {"name": ""}
 
     def submit(
         kind: str, name: str, zone: str, resource: Document, request_id: str
     ) -> str:
-        nonlocal accepted_operation
         if zone == failed_zone and (
             kind == "instance.insert" or (workflow == "init" and kind == "disk.insert")
         ):
@@ -617,13 +647,13 @@ def test_live_later_fallback_recovery(
             raise CapacityError("Injected confirmed capacity exhaustion")
         operation = original_submit(kind, name, zone, resource, request_id)
         if kind == "instance.insert" and zone == accepted_zone:
-            accepted_operation = operation
+            accepted_operation["name"] = operation
             if interruption == "submission":
                 raise UncertainError("Injected lost response after real acceptance")
         return operation
 
     def poll(name: str, zone: str) -> Document:
-        if interruption == "poll" and name == accepted_operation:
+        if interruption == "poll" and name == accepted_operation["name"]:
             raise UncertainError("Injected polling interruption after real acceptance")
         return original_poll(name, zone)
 
@@ -654,7 +684,7 @@ def test_live_later_fallback_recovery(
                 provider.init()
             else:
                 provider.move(None)
-    assert accepted_operation, sanitize_text(str(interrupted.value))
+    assert accepted_operation["name"], sanitize_text(str(interrupted.value))
     creations = [
         item
         for item in cloud.manifest.entries("actions")
@@ -670,7 +700,7 @@ def test_live_later_fallback_recovery(
         for item in cloud.manifest.entries("actions")
         if text(item, "kind").endswith(".insert")
     } == {text(item, "key") for item in creations}
-    accepted = original_poll(accepted_operation, accepted_zone)
+    accepted = original_poll(accepted_operation["name"], accepted_zone)
     assert text(recovered.active(), "id") == text(accepted, "target_id")
     print(f"Real {workflow} recovery verified after injected {interruption}")
 
@@ -745,7 +775,7 @@ def test_live_shutdown_metadata_guards(
     zone = zone_of(instance)
     metadata = document(instance.get("metadata", {}))
     for key in ("shutdown-script", "shutdown-script-url"):
-        items = [
+        items: list[Document] = [
             *objects(metadata, "items"),
             {
                 "key": key,
@@ -788,9 +818,13 @@ def test_live_security_iap_and_recovery_sequence(
 ) -> None:
     """Reuse one guest for credential, shutdown, tunnel, and recovery assertions."""
     test_live_credential_guards_before_guest_access(gcp_run, tmp_path, monkeypatch)
+    print("Live credential guards passed", flush=True)
     test_live_shutdown_metadata_guards(gcp_run, monkeypatch, exercise_power=False)
+    print("Live shutdown-hook guards passed", flush=True)
     test_human_iap_tunnel_and_interruption(gcp_run)
+    print("Live IAP forwarding and interruption passed", flush=True)
     test_live_unknown_state_preserves_move_recovery(gcp_run, tmp_path, monkeypatch)
+    print("Live ownership, retained recovery, and resume checks passed", flush=True)
 
 
 @pytest.mark.parametrize("mode", ["oslogin", "metadata"])

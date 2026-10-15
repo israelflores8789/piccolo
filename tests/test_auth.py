@@ -66,7 +66,7 @@ def test_untrusted_json_rejected_before_library_loading(
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
     gcp = config.gcp
     if discovery == "file":
-        gcp = replace(gcp, auth=replace(gcp.auth, mode="file", credential_file=path))
+        gcp = replace(gcp, auth=replace(gcp.auth, mode="file", credentials_file=path))
     elif discovery == "environment":
         monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(path))
     service_loader, user_loader = Mock(), Mock()
@@ -91,7 +91,7 @@ def test_invalid_json_and_missing_fields_are_user_errors(
     path = tmp_path / "invalid.json"
     path.write_text(payload)
     gcp = replace(
-        config.gcp, auth=replace(config.gcp.auth, mode="file", credential_file=path)
+        config.gcp, auth=replace(config.gcp.auth, mode="file", credentials_file=path)
     )
     with pytest.raises(PiccoloError):
         auth.credentials(gcp)
@@ -152,7 +152,7 @@ def test_service_account_uses_type_specific_loader(
         auth.service_account.Credentials, "from_service_account_info", loader
     )
     gcp = replace(
-        config.gcp, auth=replace(config.gcp.auth, mode="file", credential_file=path)
+        config.gcp, auth=replace(config.gcp.auth, mode="file", credentials_file=path)
     )
     assert auth.credentials(gcp) is source
     loader.assert_called_once_with(info, scopes=auth.SCOPES)

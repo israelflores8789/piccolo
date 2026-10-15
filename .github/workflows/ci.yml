@@ -18,8 +18,18 @@ concurrency:
 
 jobs:
   unit:
-    name: Local only unit tests
-    runs-on: ubuntu-26.04
+    name: Local tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, windows-2025, macos-15]
+        python: ["3.12", "3.14"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     timeout-minutes: 20
     steps:
     - name: Check out repository
@@ -30,7 +40,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: "3.12"
+        python-version: ${{ matrix.python }}
 
     - name: Set up uv
       uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -43,6 +53,14 @@ jobs:
     - name: Install development dependencies
       run: uv sync --locked --all-groups --extra gcp
 
+    - name: Set up GNU guest utilities on macOS
+      if: runner.os == 'macOS'
+      run: |
+        brew install coreutils
+        guest_bin="$(brew --prefix coreutils)/libexec/gnubin"
+        echo "$guest_bin" >> "$GITHUB_PATH"
+        echo "PICCOLO_GUEST_BIN=$guest_bin" >> "$GITHUB_ENV"
+
     - name: Run unit tests
       uses: pavelzw/pytest-action@v2
       with:
@@ -50,15 +68,18 @@ jobs:
         emoji: true
         job-summary: true
         report-title: "Piccolo unit tests"
-        custom-pytest: uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
-        custom-arguments: '-s -m "not gcp_live" --junitxml=junit.xml'
+        # Restore GNU tools after the action's login shell runs its startup files.
+        custom-pytest: >-
+          env PATH="${PICCOLO_GUEST_BIN:+$PICCOLO_GUEST_BIN:}$PATH"
+          just --set pytest 'uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest' test
+        custom-arguments: '--capture=fd --junitxml=junit-local-${{ matrix.os }}-${{ matrix.python }}.xml -o junit_logging=all -o junit_log_passing_tests=false'
 
     - name: Save JUnit test results
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: junit-unit-test-results
-        path: junit.xml
+        name: junit-local-${{ matrix.os }}-${{ matrix.python }}
+        path: junit-local-${{ matrix.os }}-${{ matrix.python }}.xml
         if-no-files-found: warn
         retention-days: 14
 

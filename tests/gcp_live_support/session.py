@@ -1,13 +1,21 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 
-"""session.py — Verify approved account baselines and recover the session network."""
+"""session.py — Verify approved account baselines and recover the session network.
+
+Set PICCOLO_GCP_LIVE_PROJECT to the exact project in .test_runs/approved.toml
+and PICCOLO_GCP_LIVE=1 before execution. The provisioner and existing VM
+accounts are piccolo-test-provisioner and piccolo-test-vm in that project.
+PICCOLO_GCP_LIVE_BASELINE optionally overrides the project-specific baseline
+path .test_runs/<project>-session-baseline.json. No project default is provided.
+"""
 
 import argparse
 import json
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from google.api_core import exceptions
@@ -15,6 +23,7 @@ from google.cloud import compute_v1, iam_admin_v1
 from google.iam.v1 import iam_policy_pb2, options_pb2, policy_pb2
 
 from gcp_live_support.deadline import ACTIVE, bind_clients, live_session, phase, timeout
+from gcp_live_support.manifest import approved_project, gate
 from piccolo.config import load
 from piccolo.data import Document, decode, document, objects, text
 from piccolo.errors import PiccoloError
@@ -23,17 +32,41 @@ from piccolo.providers.gcp.auth import credentials
 from piccolo.providers.gcp.clients import Clients
 from piccolo.state.storage import private_directory, private_file
 
-PROJECT = "piccolo-511220"
-SECRET = f"projects/{PROJECT}/secrets/PICCOLO_LIVE_DUMMY"
-ACCOUNTS = (
-    f"piccolo-test-provisioner@{PROJECT}.iam.gserviceaccount.com",
-    f"piccolo-test-vm@{PROJECT}.iam.gserviceaccount.com",
-)
-BASELINE = Path(
-    os.environ.get(
-        "PICCOLO_GCP_LIVE_BASELINE", ".test_runs/session-2026-10-12-baseline.json"
-    )
-)
+
+@dataclass(frozen=True)
+class SessionSettings:
+    """Keep the explicitly approved project fixed throughout one invocation."""
+
+    project: str
+    baseline: Path
+
+    @classmethod
+    def from_environment(cls) -> "SessionSettings":
+        """Read validated project approval and baseline settings at execution time."""
+        project = approved_project()
+        gate(project)
+        return cls(
+            project,
+            Path(
+                os.environ.get(
+                    "PICCOLO_GCP_LIVE_BASELINE",
+                    f".test_runs/{project}-session-baseline.json",
+                )
+            ),
+        )
+
+    @property
+    def accounts(self) -> tuple[str, str]:
+        """Return the fixed test account names in the approved project."""
+        return (
+            f"piccolo-test-provisioner@{self.project}.iam.gserviceaccount.com",
+            f"piccolo-test-vm@{self.project}.iam.gserviceaccount.com",
+        )
+
+    @property
+    def secret(self) -> str:
+        """Return the dummy secret resource in the approved project."""
+        return f"projects/{self.project}/secrets/PICCOLO_LIVE_DUMMY"
 
 
 def policy(client: object, resource: str) -> Document:
@@ -82,22 +115,24 @@ def policy(client: object, resource: str) -> Document:
     }
 
 
-def save(data: Document) -> None:
+def save(data: Document, settings: SessionSettings) -> None:
     """Flush the original baseline before making any session resource change."""
-    private_directory(BASELINE.parent)
-    with os.fdopen(private_file(BASELINE, create=True), "w") as stream:
+    private_directory(settings.baseline.parent)
+    with os.fdopen(private_file(settings.baseline, create=True), "w") as stream:
         json.dump(data, stream, indent=2)
         stream.flush()
         stream.truncate()
         os.fsync(stream.fileno())
 
 
-def inventory(clients: Clients) -> Document:
+def inventory(clients: Clients, settings: SessionSettings) -> Document:
     """Report test leftovers across the authorized project without deleting them."""
     from gcp_live_support.recycle_bin import RecycleBin
     from piccolo.providers.gcp.resources import SDKCloud
 
     config = load(Path(".test_runs/approved.toml"))
+    if config.gcp.project_id != settings.project:
+        raise PiccoloError("Profile project differs from authorized project")
     cloud = SDKCloud(config, clients)
     result: Document = {}
     for kind in ("instance", "disk", "snapshot"):
@@ -108,13 +143,15 @@ def inventory(clients: Clients) -> Document:
         ]
     result["firewall"] = [
         f.name
-        for f in clients.firewalls.list(project=PROJECT, retry=None, timeout=30)
+        for f in clients.firewalls.list(
+            project=settings.project, retry=None, timeout=30
+        )
         if f.name.startswith("plive-")
     ]
     result["network"] = [
         n.name
         for n in clients.networks.list(
-            project=PROJECT,
+            project=settings.project,
             retry=None,
             timeout=30,
         )
@@ -124,7 +161,7 @@ def inventory(clients: Clients) -> Document:
         s.name
         for region in ("us-west1", "us-east1")
         for s in clients.subnets.list(
-            project=PROJECT,
+            project=settings.project,
             region=region,
             retry=None,
             timeout=30,
@@ -134,7 +171,7 @@ def inventory(clients: Clients) -> Document:
     result["account"] = [
         a.email
         for a in clients.iam.list_service_accounts(
-            name=f"projects/{PROJECT}",
+            name=f"projects/{settings.project}",
             retry=None,
             timeout=30,
         )
@@ -143,7 +180,7 @@ def inventory(clients: Clients) -> Document:
     result["secret"] = [
         s.name
         for s in clients.secrets.list_secrets(
-            parent=f"projects/{PROJECT}",
+            parent=f"projects/{settings.project}",
             retry=None,
             timeout=30,
         )
@@ -151,7 +188,7 @@ def inventory(clients: Clients) -> Document:
     ]
     result["recoverable_snapshot"] = [
         text(item, "name")
-        for item in RecycleBin(PROJECT, clients.credentials).inventory()
+        for item in RecycleBin(settings.project, clients.credentials).inventory()
         if text(document(item.get("originalResource", {})), "name").startswith("plive-")
     ]
     return result
@@ -178,7 +215,7 @@ def live_workers() -> list[int]:
     return workers
 
 
-def finish(clients: Clients) -> None:
+def finish(clients: Clients, settings: SessionSettings) -> None:
     """Wait for live fixtures, reconcile manifests, remove the network, and verify."""
     import sys
 
@@ -207,12 +244,12 @@ def finish(clients: Clients) -> None:
     with phase("cleanup"):
         for path in sorted(paths):
             manifest = Manifest.open(path)
-            if text(manifest.data, "project") != PROJECT:
+            if text(manifest.data, "project") != settings.project:
                 raise PiccoloError("Continuation manifest project differs")
             if manifest.data.get("complete") is True:
                 continue
             config = load(Path(text(manifest.data, "config")))
-            if config.gcp.project_id != PROJECT or config.fingerprint != text(
+            if config.gcp.project_id != settings.project or config.fingerprint != text(
                 manifest.data, "run_settings_fingerprint"
             ):
                 raise PiccoloError("Continuation recovery settings changed")
@@ -225,17 +262,17 @@ def finish(clients: Clients) -> None:
                             config,
                             clients,
                             manifest,
-                            provisioner=ACCOUNTS[0],
+                            provisioner=settings.accounts[0],
                         ),
                         apply=True,
                     )
                 )
         if failures:
             raise PiccoloError("Final manifest cleanup failed: " + "; ".join(failures))
-        baseline = decode(BASELINE.read_text())
-        if baseline.get("project") != PROJECT:
+        baseline = decode(settings.baseline.read_text())
+        if baseline.get("project") != settings.project:
             raise PiccoloError("Session baseline project differs")
-        network(clients, baseline, create=False)
+        network(clients, baseline, settings, create=False)
     with phase("inventory"):
         previous = sys.argv
         try:
@@ -243,11 +280,11 @@ def finish(clients: Clients) -> None:
             main()
         finally:
             sys.argv = previous
-        leftovers = inventory(clients)
+        leftovers = inventory(clients, settings)
         if any(leftovers.values()):
             raise PiccoloError("Final test inventory still contains resources")
     report = {
-        "project": PROJECT,
+        "project": settings.project,
         "elapsed_seconds": deadline.clock() - deadline.started,
         "allowed_seconds": deadline.total_seconds,
         "iam_preserved": True,
@@ -267,10 +304,17 @@ def finish(clients: Clients) -> None:
     )
 
 
-def network(clients: Clients, baseline: Document, *, create: bool) -> None:
+def network(
+    clients: Clients, baseline: Document, settings: SessionSettings, *, create: bool
+) -> None:
     """Create or delete only the recorded session network and temporary role."""
-    role, member = "roles/compute.networkAdmin", f"serviceAccount:{ACCOUNTS[0]}"
-    resource = f"projects/{PROJECT}"
+    if baseline.get("project") != settings.project:
+        raise PiccoloError("Session baseline project differs")
+    role, member = (
+        "roles/compute.networkAdmin",
+        f"serviceAccount:{settings.accounts[0]}",
+    )
+    resource = f"projects/{settings.project}"
     if create:
         current = clients.projects.get_iam_policy(
             request=iam_policy_pb2.GetIamPolicyRequest(
@@ -284,7 +328,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             if not current.etag:
                 raise PiccoloError("Project IAM policy has no etag")
             baseline["network_admin_added"] = True
-            save(baseline)
+            save(baseline, settings)
             clients.projects.set_iam_policy(
                 request=iam_policy_pb2.SetIamPolicyRequest(
                     resource=resource, policy=current
@@ -296,23 +340,23 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             name = "plive-session-" + uuid.uuid4().hex[:12]
             network_entry: Document = {"name": name, "id": "", "subnets": []}
             baseline["network"] = network_entry
-            save(baseline)
+            save(baseline, settings)
     entry = document(baseline["network"])
     baseline["network"] = entry
     name = text(entry, "name")
     marker = f"Piccolo approved live session {name}"
     try:
         observed = clients.networks.get(
-            project=PROJECT, network=name, retry=None, timeout=30
+            project=settings.project, network=name, retry=None, timeout=30
         )
     except exceptions.NotFound:
         observed = None
     if create and observed is None:
         entry["absent_before"] = True
-        save(baseline)
+        save(baseline, settings)
         operation = clients.networks.insert(
             request=compute_v1.InsertNetworkRequest(
-                project=PROJECT,
+                project=settings.project,
                 request_id=str(uuid.uuid4()),
                 network_resource=compute_v1.Network(
                     name=name, description=marker, auto_create_subnetworks=False
@@ -322,10 +366,10 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             timeout=30,
         )
         entry["operation"] = operation.name
-        save(baseline)
+        save(baseline, settings)
         operation.result(timeout=timeout(120))
         observed = clients.networks.get(
-            project=PROJECT, network=name, retry=None, timeout=30
+            project=settings.project, network=name, retry=None, timeout=30
         )
     if observed is not None:
         if (
@@ -335,7 +379,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
         ):
             raise PiccoloError("Session network ownership changed")
         entry["id"] = str(observed.id)
-        save(baseline)
+        save(baseline, settings)
     for index, region in enumerate(("us-west1", "us-east1"), start=1):
         subnet_name = name + "-subnet"
         entries = objects(entry, "subnets")
@@ -347,12 +391,12 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             subnet_entry = {"name": subnet_name, "region": region, "id": ""}
             entries.append(subnet_entry)
             entry["subnets"] = [s for s in entries]
-            save(baseline)
+            save(baseline, settings)
         if subnet_entry is None:
             continue
         try:
             subnet = clients.subnets.get(
-                project=PROJECT,
+                project=settings.project,
                 region=region,
                 subnetwork=subnet_name,
                 retry=None,
@@ -362,16 +406,16 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             subnet = None
         if create and subnet is None:
             subnet_entry["absent_before"] = True
-            save(baseline)
+            save(baseline, settings)
             operation = clients.subnets.insert(
                 request=compute_v1.InsertSubnetworkRequest(
-                    project=PROJECT,
+                    project=settings.project,
                     region=region,
                     request_id=str(uuid.uuid4()),
                     subnetwork_resource=compute_v1.Subnetwork(
                         name=subnet_name,
                         description=marker,
-                        network=f"projects/{PROJECT}/global/networks/{name}",
+                        network=f"projects/{settings.project}/global/networks/{name}",
                         ip_cidr_range=f"10.250.{index}.0/24",
                         private_ip_google_access=True,
                     ),
@@ -380,10 +424,10 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
                 timeout=30,
             )
             subnet_entry["operation"] = operation.name
-            save(baseline)
+            save(baseline, settings)
             operation.result(timeout=timeout(120))
             subnet = clients.subnets.get(
-                project=PROJECT,
+                project=settings.project,
                 region=region,
                 subnetwork=subnet_name,
                 retry=None,
@@ -400,10 +444,10 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
             ):
                 raise PiccoloError("Session subnet ownership changed")
             subnet_entry["id"] = str(subnet.id)
-            save(baseline)
+            save(baseline, settings)
             if not create:
                 clients.subnets.delete(
-                    project=PROJECT,
+                    project=settings.project,
                     region=region,
                     subnetwork=subnet_name,
                     retry=None,
@@ -421,7 +465,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
     else:
         if observed is not None:
             clients.networks.delete(
-                project=PROJECT, network=name, retry=None, timeout=30
+                project=settings.project, network=name, retry=None, timeout=30
             ).result(timeout=timeout(120))
         if baseline.get("network_admin_added") is True:
             current = clients.projects.get_iam_policy(
@@ -451,7 +495,7 @@ def network(clients: Clients, baseline: Document, *, create: bool) -> None:
                 timeout=30,
             )
             baseline["network_admin_added"] = False
-            save(baseline)
+            save(baseline, settings)
         print("Session VPC/subnets deleted and temporary provisioner role removed")
 
 
@@ -471,22 +515,21 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    if os.environ.get("PICCOLO_GCP_LIVE_PROJECT") != PROJECT:
-        raise PiccoloError("Session project must be piccolo-511220")
+    settings = SessionSettings.from_environment()
     config = load(Path(".test_runs/approved.toml"))
-    if config.gcp.project_id != PROJECT:
+    if config.gcp.project_id != settings.project:
         raise PiccoloError("Profile project differs from authorized project")
     auth = credentials(config.gcp)
-    if getattr(auth, "service_account_email", None) != ACCOUNTS[0]:
+    if getattr(auth, "service_account_email", None) != settings.accounts[0]:
         raise PiccoloError("Session credentials must be the approved provisioner")
     clients = Clients(auth)
     bind_clients(clients)
     if args.action == "finish":
-        finish(clients)
+        finish(clients, settings)
         return
     if args.action == "inventory":
-        result = inventory(clients)
-        path = BASELINE.with_name(BASELINE.stem + "-inventory.json")
+        result = inventory(clients, settings)
+        path = settings.baseline.with_name(settings.baseline.stem + "-inventory.json")
         with os.fdopen(private_file(path, create=True), "w") as stream:
             json.dump(result, stream, indent=2)
         if any(result.values()):
@@ -497,13 +540,13 @@ def main() -> None:
         from gcp_live_support.manifest import Manifest
         from gcp_live_support.recycle_bin import RecycleBin
 
-        recycle = RecycleBin(PROJECT, auth)
+        recycle = RecycleBin(settings.project, auth)
         for directory in Path(".test_runs").iterdir():
             path = directory / "manifest.json"
             if not directory.is_dir() or not path.exists():
                 continue
             manifest = Manifest.open(path)
-            if text(manifest.data, "project") != PROJECT or not any(
+            if text(manifest.data, "project") != settings.project or not any(
                 text(entry, "kind") == "snapshot"
                 for entry in manifest.entries("resources")
             ):
@@ -524,16 +567,16 @@ def main() -> None:
             raise PiccoloError("Unproven test snapshots remain in the recycle bin")
         print("Zero test snapshot leftovers verified in the recycle bin")
         return
-    secret = clients.secrets.get_secret(name=SECRET, retry=None, timeout=30)
+    secret = clients.secrets.get_secret(name=settings.secret, retry=None, timeout=30)
     baseline: Document
-    if BASELINE.exists():
-        baseline = decode(BASELINE.read_text())
+    if settings.baseline.exists():
+        baseline = decode(settings.baseline.read_text())
     elif args.action in {"verify", "network-remove"}:
         raise PiccoloError("Original baseline is unavailable")
     else:
         accounts: Document = {}
-        for account in ACCOUNTS:
-            resource = f"projects/{PROJECT}/serviceAccounts/{account}"
+        for account in settings.accounts:
+            resource = f"projects/{settings.project}/serviceAccounts/{account}"
             observed = clients.iam.get_service_account(
                 name=resource, retry=None, timeout=30
             )
@@ -542,20 +585,20 @@ def main() -> None:
                 "policy": policy(clients.iam, resource),
             }
         baseline = {
-            "project": PROJECT,
+            "project": settings.project,
             "accounts": accounts,
-            "project_policy": policy(clients.projects, f"projects/{PROJECT}"),
-            "secret_policy": policy(clients.secrets, SECRET),
+            "project_policy": policy(clients.projects, f"projects/{settings.project}"),
+            "secret_policy": policy(clients.secrets, settings.secret),
             "secret_created": str(secret.create_time),
             "secret_labels": dict(secret.labels),
         }
-        save(baseline)
-    if baseline.get("project") != PROJECT or baseline.get("secret_created") != str(
-        secret.create_time
-    ):
+        save(baseline, settings)
+    if baseline.get("project") != settings.project or baseline.get(
+        "secret_created"
+    ) != str(secret.create_time):
         raise PiccoloError("Session project or secret identity changed")
     if args.action.startswith("network-"):
-        network(clients, baseline, create=args.action == "network-prepare")
+        network(clients, baseline, settings, create=args.action == "network-prepare")
         return
     original = {
         key: str(value) for key, value in document(baseline["secret_labels"]).items()
@@ -566,7 +609,7 @@ def main() -> None:
     if args.action == "verify":
         for account, raw in document(baseline["accounts"]).items():
             entry = document(raw)
-            resource = f"projects/{PROJECT}/serviceAccounts/{account}"
+            resource = f"projects/{settings.project}/serviceAccounts/{account}"
             observed = clients.iam.get_service_account(
                 name=resource, retry=None, timeout=30
             )
@@ -578,8 +621,8 @@ def main() -> None:
                 raise PiccoloError(
                     "Original service account or policy was not restored"
                 )
-        current = policy(clients.projects, f"projects/{PROJECT}")
-        for account in ACCOUNTS:
+        current = policy(clients.projects, f"projects/{settings.project}")
+        for account in settings.accounts:
             member = f"serviceAccount:{account}"
 
             def grants(value: Document, member: str) -> list[str]:
@@ -597,11 +640,11 @@ def main() -> None:
                 document(baseline["project_policy"]), member
             ):
                 raise PiccoloError("Original account project roles were not restored")
-        if policy(clients.secrets, SECRET) != baseline["secret_policy"]:
+        if policy(clients.secrets, settings.secret) != baseline["secret_policy"]:
             raise PiccoloError("Original dummy secret policy was not restored")
         print("Approved dummy label and both original service accounts/IAM verified")
     else:
-        print(f"Original account/IAM/secret baseline saved: {BASELINE}")
+        print(f"Original account/IAM/secret baseline saved: {settings.baseline}")
         print("Operator-managed dummy-secret label verified without changes")
 
 

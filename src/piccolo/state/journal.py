@@ -6,19 +6,19 @@
 import hashlib
 import json
 import os
-import tempfile
 from pathlib import Path
 
 from piccolo.config.models import Config
 from piccolo.data import Document, Value, decode, document, text
 from piccolo.errors import PiccoloError
 from piccolo.privacy import sanitize
-from piccolo.state.storage import private_directory, private_file
+from piccolo.state.paths import state_root
+from piccolo.state.storage import private_directory, private_file, temporary_file
 
 
 def state_directory(config: Config) -> Path:
     """Return a project/environment key shared across configuration paths."""
-    root = Path(os.environ.get("PICCOLO_STATE_DIR", str(Path.home() / ".piccolo")))
+    root = state_root()
     identity = f"{config.provider}:{config.gcp.project_id}:{config.environment}"
     key = hashlib.sha256(identity.encode()).hexdigest()[:24]
     return root / key
@@ -75,7 +75,7 @@ class Journal:
         private_directory(self.directory)
         if self.path.exists() or self.path.is_symlink():
             os.close(private_file(self.path))
-        descriptor, temporary = tempfile.mkstemp(dir=self.directory, prefix="state-")
+        descriptor, temporary = temporary_file(self.directory, "state-")
         try:
             with os.fdopen(descriptor, "w") as stream:
                 json.dump(sanitize(self.data), stream, indent=2, sort_keys=True)
@@ -90,7 +90,7 @@ class Journal:
                 finally:
                     os.close(directory)
         finally:
-            Path(temporary).unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
 
     def begin(self, operation: Document) -> None:
         """Persist a new operation before its first mutation."""

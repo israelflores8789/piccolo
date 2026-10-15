@@ -20,7 +20,7 @@ operation_timeout = 600
 [gcp.auth]
 mode = "adc"
 # mode = "file"
-# credential_file = "./credentials.json"
+# credentials_file = "./credentials.json"
 # impersonate_service_account = "provisioner@my-gcp-project.iam.gserviceaccount.com"
 
 [gcp.instance]

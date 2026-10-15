@@ -4,6 +4,9 @@
 """gcp_live.py — Offline profile validation and independently invocable janitor.
 
 Set PICCOLO_GCP_LIVE_PROJECT to match the live profile and recovery manifest.
+Project-qualified identities use the validated profile project, which must
+exactly match that environment variable. The human connection-account policy
+applies to every live profile, not just the separate SDK impersonation test.
 """
 
 import argparse
@@ -92,7 +95,7 @@ def profile(path: Path) -> Config:
     return config
 
 
-def local_preflight() -> None:
+def local_preflight(config: Config | None = None) -> None:
     """Require gcloud and OpenSSH before loading cloud credentials."""
     missing = [
         name
@@ -101,10 +104,19 @@ def local_preflight() -> None:
     ]
     if missing:
         raise PiccoloError("Install connection prerequisites: " + ", ".join(missing))
+    if os.name == "nt" and config is not None:
+        from piccolo.providers.gcp.connection import GCloudConnection
+
+        GCloudConnection(config.gcp).ssh.client.executable("ssh")
 
 
 def run_config(
-    base: Config, directory: Path, run: str, *, create_account: bool
+    base: Config,
+    directory: Path,
+    run: str,
+    *,
+    create_account: bool,
+    bootstrap: bool = True,
 ) -> Config:
     """Write a sanitized durable config and an exclusively harmless bootstrap."""
     g = base.gcp
@@ -116,7 +128,8 @@ def run_config(
     script.write_text(
         "#!/bin/bash\n# Copyright 2026 Israel Flores-Arbolay\n"
         "# SPDX-License-Identifier: Apache-2.0\n"
-        'set -eu\nprintf "piccolo live marker\\n" >> "$HOME/piccolo-live-marker"\n'
+        'set -eu\nprintf "piccolo live marker\\n" >> "$HOME/piccolo-live-marker"\n',
+        newline="\n",
     )
     quote = json.dumps
     account = (
@@ -126,22 +139,27 @@ def run_config(
     )
     subnet_map = ", ".join(f"{quote(k)} = {quote(v)}" for k, v in g.subnets.items())
     credential = (
-        f"credential_file = {quote(str(g.auth.credential_file))}\n"
-        if g.auth.credential_file
+        f"credentials_file = {quote(str(g.auth.credentials_file))}\n"
+        if g.auth.credentials_file
         else ""
     )
     path = directory / "piccolo.toml"
+    setup = (
+        f"""[bootstrap]
+script = "marker.sh"
+remote_path = ".piccolo/bootstrap/marker.sh"
+execution_user = {quote(g.ssh_user)}
+timeout = 120
+"""
+        if bootstrap
+        else ""
+    )
     path.write_text(f"""# Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 schema_version = 1
 provider = "gcp"
 environment = {quote(run)}
-[bootstrap]
-script = "marker.sh"
-remote_path = ".piccolo/bootstrap/marker.sh"
-execution_user = {quote(g.ssh_user)}
-timeout = 120
-[gcp]
+{setup}[gcp]
 project_id = {quote(g.project_id)}
 enable_apis = false
 operation_timeout = {g.operation_timeout}

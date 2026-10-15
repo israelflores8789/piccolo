@@ -18,8 +18,10 @@ install-dev:
     @echo "Installing development dependencies..."
     @uv sync --locked --all-groups --all-extras
 
+# Run local unit tests without cloud credentials or API requests.
+[positional-arguments]
 test *args:
-    {{pytest}} -v -s {{args}}
+    {{pytest}} -v -s -m "not gcp_live and not gcp_win_live" "$@"
 
 # Set PICCOLO_GCP_LIVE_PROJECT directly or load it with --dotenv-path.
 approval-gcp-live config:
@@ -38,6 +40,22 @@ test-gcp-live config test-name="tests/test_gcp_live.py" *args:
     PICCOLO_GCP_LIVE_LOG="$log_file" uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(os.environ["PICCOLO_GCP_LIVE_LOG"]), create=True))'
     PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="$config" \
         {{pytest}} --gcp-live -vv -s --durations=0 --tb=short --color=no "$test_name" "$@" < /dev/null \
+        2>&1 | tee "$log_file"
+
+[positional-arguments]
+test-gcp-win-live config test-name="tests/test_gcp_win_live.py" *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${PICCOLO_GCP_LIVE_PROJECT:?Set the approved GCP project}"
+    : "${PICCOLO_GCP_LIVE_APPROVAL_SHA256:?Pin the digest from just approval-gcp-live}"
+    : "${PICCOLO_GCP_LIVE_BUDGET_FILE:?Set the reviewed cumulative spending ledger}"
+    config="$1"
+    test_name="$2"
+    shift 2
+    log_file="${PICCOLO_GCP_LIVE_LOG:-.test_logs/pytest-gcp-win-live.log}"
+    PICCOLO_GCP_LIVE_LOG="$log_file" uv run --locked python -c 'import os; from pathlib import Path; from piccolo.state.storage import private_directory, private_file; private_directory(Path(".test_logs")); private_directory(Path(".test_runs")); os.close(private_file(Path(os.environ["PICCOLO_GCP_LIVE_LOG"]), create=True))'
+    PYTHONUNBUFFERED=1 PICCOLO_GCP_LIVE=1 PICCOLO_GCP_LIVE_CONFIG="$config" \
+        {{pytest}} --gcp-win-live -m gcp_win_live -vv -s --durations=0 --tb=short --color=no "$test_name" "$@" < /dev/null \
         2>&1 | tee "$log_file"
 
 # Recovery is preview-only unless apply=1; uses the retained run manifest.
@@ -90,8 +108,9 @@ lint-fix:
     uv run --locked ruff check --fix {{check_dirs}}
     uv run --locked ruff format {{check_dirs}}
 
-typecheck:
-    uv run --locked pyrefly check {{src_dir}} tests/gcp_live_support
+[positional-arguments]
+typecheck *args:
+    uv run --locked pyrefly check {{src_dir}} tests/gcp_live_support "$@"
 
 spell-diff:
     uvx --from typos typos --diff

@@ -16,6 +16,7 @@ from piccolo.config.models import GCP
 from piccolo.data import decode, text
 from piccolo.errors import PiccoloError
 from piccolo.privacy import remember_secrets
+from piccolo.providers.gcp.paths import cloud_sdk_directory
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -23,17 +24,7 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 def adc_path() -> Path:
     """Locate the well-known ADC file using the Cloud SDK directory rules."""
-    override = os.environ.get("CLOUDSDK_CONFIG")
-    if override:
-        directory = Path(override)
-    elif os.name == "nt":
-        directory = (
-            Path(os.environ.get("APPDATA", os.environ.get("SYSTEMDRIVE", "C:") + "\\"))
-            / "gcloud"
-        )
-    else:
-        directory = Path.home() / ".config" / "gcloud"
-    return directory / "application_default_credentials.json"
+    return cloud_sdk_directory() / "application_default_credentials.json"
 
 
 def file_credentials(path: Path) -> Credentials:
@@ -96,7 +87,7 @@ def file_credentials(path: Path) -> Credentials:
 def credentials(config: GCP) -> Credentials:
     """Resolve vetted file/ADC credentials and explicit provisioner impersonation."""
     try:
-        path = config.auth.credential_file
+        path = config.auth.credentials_file
         if path is None:
             explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
             if explicit:

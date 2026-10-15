@@ -3,15 +3,13 @@
 
 """cli.py — Declarative environment commands and predictable config selection."""
 
-import sys
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from yaspin import yaspin
 
 from piccolo.config import load
+from piccolo.config.spinner import loading_spinner
 from piccolo.data import text
 from piccolo.errors import PiccoloError
 from piccolo.logger import emit, log
@@ -77,29 +75,34 @@ def invoke(
             return
         match action:
             case "status":
-                emit(create(config).inspect())
+                with loading_spinner(config.spinner, action):
+                    result = create(config).inspect()
+                emit(result)
             case "plan":
-                emit(create(config).plan())
+                with loading_spinner(config.spinner, action):
+                    result = create(config).plan()
+                emit(result)
             case "connect":
-                with environment_lock(config):
+                with (
+                    environment_lock(config),
+                    loading_spinner(config.spinner, action),
+                ):
                     provider = create(config)
                     zone = provider.start()
                     provider.connection.ready(zone)
                 provider.connection.shell(zone)
             case "tunnel":
-                with environment_lock(config):
+                with (
+                    environment_lock(config),
+                    loading_spinner(config.spinner, action),
+                ):
                     provider = create(config)
                     zone = text(provider.active(), "zone").split("/")[-1]
                 provider.connection.tunnel(zone)
             case _:
                 with (
                     environment_lock(config),
-                    yaspin(
-                        text=f"Piccolo {action}",
-                        stream=sys.stderr,
-                    )
-                    if sys.stderr.isatty()
-                    else nullcontext(),
+                    loading_spinner(config.spinner, action),
                 ):
                     provider = create(config)
                     if action not in provider.capabilities:

@@ -157,6 +157,17 @@ When the USER explicitly requests live testing against GCP (or any other live pr
     - Egress, VM --> Internet: $0.12 per gigabyte.
   - Standard VPC Firewall: free.
 
+### Windows Development
+
+WHEN working in a Windows environment for Windows compatibility development and testing:
+- PREFER native PowerShell for automated repository and tooling commands.
+- NEVER use WSL unless explicitly authorized by the USER.
+- Windows compatibility tests MUST use native Windows Python, not Linux Python under WSL.
+- USE Git Bash WHEN a command requires Bash syntax or when testing Git Bash compatibility. 
+- ALL shell-script `just` recipes MUST use Bash. Do NOT use PowerShell in `just` recipes.
+- User-facing terminal acceptance MUST support Windows Terminal hosting Git Bash, with Piccolo launching native Windows OpenSSH. PowerShell execution, while supported, is not a substitute for this acceptance test.
+- Shell selection does NOT authorize live testing; the project's live-test approval requirements still apply regardless of development or testing environment.
+
 ### Prohibitions
 
 The following actions are **prohibited** and are reserved exclusively for the user. When encountering a task that involves a prohibited action, you MUST **stop** and **report** to the user the conflict:

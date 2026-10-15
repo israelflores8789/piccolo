@@ -11,6 +11,7 @@
   "ruff.enable": true,
   "ruff.organizeImports": true,
   "evenBetterToml.schema.associations": {
-    "pyproject.toml": "https://json.schemastore.org/pyproject.json"
+    "pyproject.toml": "https://json.schemastore.org/pyproject.json",
+    "piccolo.toml": "https://raw.githubusercontent.com/israelflores8789/piccolo/main/config.schema.json"
   }
 }

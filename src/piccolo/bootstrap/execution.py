@@ -4,10 +4,9 @@
 """execution.py — Durable authorization and guest-side receipts for opaque scripts."""
 
 import hashlib
-import tempfile
+import os
 import time
 from collections.abc import Callable
-from pathlib import Path
 
 from piccolo.bootstrap.staging import home_path, private_path, upload
 from piccolo.config.models import Config
@@ -15,6 +14,7 @@ from piccolo.data import Document, document, text
 from piccolo.errors import PiccoloError, UncertainError
 from piccolo.providers.base import Connection
 from piccolo.state.journal import Journal
+from piccolo.state.storage import private_file, temporary_directory
 
 
 def receipt(journal: Journal, connection: Connection, zone: str) -> Document:
@@ -130,9 +130,15 @@ printf '%s\\n' "$rc" > "$attempt/exit-code.tmp"
 mv "$attempt/exit-code.tmp" "$attempt/exit-code"
 exit "$rc"
 """
-    with tempfile.TemporaryDirectory(prefix="piccolo-bootstrap-") as temporary:
-        local = Path(temporary) / "runner.sh"
-        local.write_text(wrapper)
+    with temporary_directory("piccolo-bootstrap-") as temporary:
+        local = temporary / "runner.sh"
+        with os.fdopen(
+            private_file(local, create=True, exclusive=True),
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as stream:
+            stream.write(wrapper)
         runner_digest = hashlib.sha256(local.read_bytes()).hexdigest()
         upload(connection, zone, local, runner, runner_digest)
     record["status"] = "started"

@@ -20,6 +20,7 @@ from piccolo.config.models import (
     privileged_role,
     settings_fingerprint,
 )
+from piccolo.config.spinner import DEFAULT_SPINNER, validate_spinner
 from piccolo.data import Document, Value, document
 from piccolo.errors import PiccoloError
 
@@ -119,21 +120,22 @@ def load(path: Path | None = None) -> Config:
     provider = root.string("provider", "gcp")
     if provider != "gcp":
         raise PiccoloError(f"provider: unsupported provider {provider!r}")
+    spinner = validate_spinner(root.string("spinner", DEFAULT_SPINNER))
     cloud = root.section("gcp")
     project = named(
         cloud.string("project_id"), "gcp.project_id", r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
     )
     auth = cloud.section("auth")
     mode = auth.string("mode", "adc")
-    credential = auth.string("credential_file", "")
+    credentials_file = auth.string("credentials_file", "")
     impersonate = auth.string("impersonate_service_account", "")
-    if mode not in {"adc", "file"} or (mode == "file") != bool(credential):
+    if mode not in {"adc", "file"} or (mode == "file") != bool(credentials_file):
         raise PiccoloError(
-            "gcp.auth: use mode='file' with credential_file, or mode='adc'"
+            "gcp.auth: use mode='file' with credentials_file, or mode='adc'"
         )
-    credential_path = (
-        local_file(selected.parent, credential, "gcp.auth.credential_file")
-        if credential
+    credentials_path = (
+        local_file(selected.parent, credentials_file, "gcp.auth.credentials_file")
+        if credentials_file
         else None
     )
     instance = cloud.section("instance")
@@ -293,9 +295,10 @@ def load(path: Path | None = None) -> Config:
         selected,
         environment,
         provider,
+        spinner,
         GCP(
             project,
-            Auth(mode, credential_path, impersonate),
+            Auth(mode, credentials_path, impersonate),
             name,
             machine,
             account,
