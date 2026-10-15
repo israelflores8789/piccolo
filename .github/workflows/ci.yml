@@ -69,15 +69,17 @@ jobs:
         job-summary: true
         report-title: "Piccolo unit tests"
         # Restore GNU tools after the action's login shell runs its startup files.
-        custom-pytest: env PATH="${PICCOLO_GUEST_BIN:+$PICCOLO_GUEST_BIN:}$PATH" uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
-        custom-arguments: '--capture=fd -m "not gcp_live and not gcp_win_live" --junitxml=junit.xml -o junit_logging=all -o junit_log_passing_tests=false'
+        custom-pytest: >-
+          env PATH="${PICCOLO_GUEST_BIN:+$PICCOLO_GUEST_BIN:}$PATH"
+          just --set pytest 'uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest' test
+        custom-arguments: '--capture=fd --junitxml=junit-local-${{ matrix.os }}-${{ matrix.python }}.xml -o junit_logging=all -o junit_log_passing_tests=false'
 
     - name: Save JUnit test results
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: junit-unit-test-results-${{ matrix.os }}-${{ matrix.python }}
-        path: junit.xml
+        name: junit-local-${{ matrix.os }}-${{ matrix.python }}
+        path: junit-local-${{ matrix.os }}-${{ matrix.python }}.xml
         if-no-files-found: warn
         retention-days: 14
 

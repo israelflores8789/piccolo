@@ -39,7 +39,7 @@ just install-dev
 just ci
 ```
 
-Shared OpenSSH mechanics live in `piccolo.openssh`; GCP authorization, host-key retrieval, address selection, and IAP setup remain in the GCP provider. State-root paths belong to `piccolo.state.paths`, Cloud SDK paths to `piccolo.providers.gcp.paths`, and Windows process containment to `piccolo.win32process`. Run the provider-independent client tests with `just test tests/test_openssh.py`, provider session tests with `just test tests/test_native_ssh.py`, and native ACL checks with `just test tests/test_windows_storage.py`. Platform-specific cases skip on other operating systems; `just test-local` excludes both live suites.
+Shared OpenSSH mechanics live in `piccolo.openssh`; GCP authorization, host-key retrieval, address selection, and IAP setup remain in the GCP provider. State-root paths belong to `piccolo.state.paths`, Cloud SDK paths to `piccolo.providers.gcp.paths`, and Windows process containment to `piccolo.win32process`. Run the provider-independent client tests with `just test tests/test_openssh.py`, provider session tests with `just test tests/test_native_ssh.py`, and native ACL checks with `just test tests/test_windows_storage.py`. Platform-specific cases skip on other operating systems; `just test` excludes both live suites.
 
 ### Native Windows
 
@@ -276,7 +276,7 @@ cygpath -u $env:USERPROFILE
 
 ### GCP Windows live selection
 
-The native Windows GCP suite is `tests/test_gcp_win_live.py`, marked `gcp_win_live` and selected with `--gcp-win-live` through `just test-gcp-win-live PROFILE`. It is excluded from `just test-local`, `just ci`, and CI, and cannot be combined with the POSIX `--gcp-live` selection. The same project approval digest, cumulative duration, spending ledger, manifests, and scoped janitor apply. The Windows recipe requires `PICCOLO_GCP_LIVE_BUDGET_FILE`; no live validation is authorized merely by installing Piccolo or selecting a marker.
+The native Windows GCP suite is `tests/test_gcp_win_live.py`, marked `gcp_win_live` and selected with `--gcp-win-live` through `just test-gcp-win-live PROFILE`. It is excluded from `just test`, `just ci`, and CI, and cannot be combined with the POSIX `--gcp-live` selection. The same project approval digest, cumulative duration, spending ledger, manifests, and scoped janitor apply. The Windows recipe requires `PICCOLO_GCP_LIVE_BUDGET_FILE`; no live validation is authorized merely by installing Piccolo or selecting a marker.
 
 Automated GCP Windows cases use the explicitly logged-in `piccolo-test-provisioner` connection account, the approved existing test VM account, and disposable manifest-recorded keys. They cover SSH/SCP expiration and renewal in metadata and OS Login modes without reading or replacing the workstation's ordinary SSH key. Human-account terminal/theme acceptance needs separate explicit authorization and is not part of these automated cases. The Windows suite has been authored and checked offline but has not been run against GCP as part of this implementation.
 

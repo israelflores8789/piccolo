@@ -18,9 +18,10 @@ install-dev:
     @echo "Installing development dependencies..."
     @uv sync --locked --all-groups --all-extras
 
+# Run local unit tests without cloud credentials or API requests.
 [positional-arguments]
 test *args:
-    {{pytest}} -v -s "$@"
+    {{pytest}} -v -s -m "not gcp_live and not gcp_win_live" "$@"
 
 # Set PICCOLO_GCP_LIVE_PROJECT directly or load it with --dotenv-path.
 approval-gcp-live config:
@@ -114,10 +115,7 @@ typecheck *args:
 spell-diff:
     uvx --from typos typos --diff
 
-test-local:
-    {{pytest}} -v -m "not gcp_live and not gcp_win_live"
-
-ci: test-local lint typecheck
+ci: test lint typecheck
 
 build: lock-check
     @echo "Building the project..."

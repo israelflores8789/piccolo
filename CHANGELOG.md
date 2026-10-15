@@ -22,11 +22,12 @@ All notable changes to this project will be documented in this file. The format 
 - Run shared OpenSSH regression tests independently of GCP, with actual local key preparation on each supported platform and separately selectable Windows-specific checks.
 - Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.
 - Centralize Cloud SDK configuration paths and prefer the Windows SDK's bundled interpreter when present; retain separate SDK and connection identities.
-- Extract shared GCP SSH behavior behind one transport interface and add `just test-local` with explicit live-test exclusions.
+- Extract shared GCP SSH behavior behind one transport interface.
 - Centralize spinner selection, loading messages, and terminal detection in `config/spinner.py`; display progress during `status`, `plan`, and preparation for `connect` and `tunnel`, stopping before foreground SSH or tunnel sessions and disabling animation for redirected output.
 
 ### Fixed
 
+- Restore per-test CI summaries by removing pytest's default quiet mode and running CI through `just test`, which now explicitly excludes live tests.
 - Preserve the human gcloud connector in the Windows live harness, independently of provisioner SDK credentials and the attached guest service account.
 - Select the configured project's primary OS Login account; reuse connector tokens only within bounded native operations and allow readiness preparation to use its configured deadline.
 - Protect temporary human impersonation credentials with native private storage and allow Windows disposable-key probes enough initial lifetime for SDK preparation.

@@ -144,7 +144,7 @@ min-severity = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+addopts = "--strict-markers"
 markers = [
     "gcp_live: opt-in disposable-project POSIX GCP tests, excluded by default",
     "gcp_win_live: opt-in native Windows GCP transport tests, excluded by default",
