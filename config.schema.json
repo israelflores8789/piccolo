@@ -255,7 +255,7 @@
           ],
           "default": "adc"
         },
-        "credential_file": {
+        "credentials_file": {
           "type": "string",
           "default": "",
           "description": "Path to a user-controlled Google service_account or authorized_user JSON file, relative to piccolo.toml. Required when mode is file; the file must exist. SDK loading validates credential type, Google OAuth token endpoint, and googleapis.com universe; external-account and embedded impersonation JSON are unsupported."
@@ -279,17 +279,17 @@
           },
           "then": {
             "properties": {
-              "credential_file": {
+              "credentials_file": {
                 "minLength": 1
               }
             },
             "required": [
-              "credential_file"
+              "credentials_file"
             ]
           },
           "else": {
             "properties": {
-              "credential_file": {
+              "credentials_file": {
                 "maxLength": 0
               }
             }

@@ -215,7 +215,7 @@ def test_human_source_provisioner_impersonation(tmp_path: Path) -> None:
             auth=replace(
                 base.gcp.auth,
                 mode="file",
-                credential_file=source_path,
+                credentials_file=source_path,
                 impersonate_service_account=target,
             ),
         )
@@ -570,10 +570,12 @@ def test_live_credential_guards_before_guest_access(
                 auth_config = replace(provider.gcp.auth, impersonate_service_account="")
                 if source == "file":
                     auth_config = replace(
-                        auth_config, mode="file", credential_file=path
+                        auth_config, mode="file", credentials_file=path
                     )
                 else:
-                    auth_config = replace(auth_config, mode="adc", credential_file=None)
+                    auth_config = replace(
+                        auth_config, mode="adc", credentials_file=None
+                    )
                     injection.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(path))
                 changed = replace(
                     provider.config, gcp=replace(provider.gcp, auth=auth_config)

@@ -127,15 +127,15 @@ def load(path: Path | None = None) -> Config:
     )
     auth = cloud.section("auth")
     mode = auth.string("mode", "adc")
-    credential = auth.string("credential_file", "")
+    credentials_file = auth.string("credentials_file", "")
     impersonate = auth.string("impersonate_service_account", "")
-    if mode not in {"adc", "file"} or (mode == "file") != bool(credential):
+    if mode not in {"adc", "file"} or (mode == "file") != bool(credentials_file):
         raise PiccoloError(
-            "gcp.auth: use mode='file' with credential_file, or mode='adc'"
+            "gcp.auth: use mode='file' with credentials_file, or mode='adc'"
         )
-    credential_path = (
-        local_file(selected.parent, credential, "gcp.auth.credential_file")
-        if credential
+    credentials_path = (
+        local_file(selected.parent, credentials_file, "gcp.auth.credentials_file")
+        if credentials_file
         else None
     )
     instance = cloud.section("instance")
@@ -298,7 +298,7 @@ def load(path: Path | None = None) -> Config:
         spinner,
         GCP(
             project,
-            Auth(mode, credential_path, impersonate),
+            Auth(mode, credentials_path, impersonate),
             name,
             machine,
             account,

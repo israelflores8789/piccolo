@@ -245,7 +245,7 @@ class GCloudConnection:
     def check_identity(self) -> None:
         """Report the connection identity and enforce explicit credential separation."""
         if (
-            self.config.auth.credential_file
+            self.config.auth.credentials_file
             or self.config.auth.impersonate_service_account
         ) and not (
             self.config.connection_account or self.config.connection_impersonate

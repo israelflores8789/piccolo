@@ -34,7 +34,7 @@ class Auth:
     """Separate SDK credentials from the selected gcloud connection account."""
 
     mode: str
-    credential_file: Path | None
+    credentials_file: Path | None
     impersonate_service_account: str
 
 

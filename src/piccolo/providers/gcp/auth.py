@@ -87,7 +87,7 @@ def file_credentials(path: Path) -> Credentials:
 def credentials(config: GCP) -> Credentials:
     """Resolve vetted file/ADC credentials and explicit provisioner impersonation."""
     try:
-        path = config.auth.credential_file
+        path = config.auth.credentials_file
         if path is None:
             explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
             if explicit:

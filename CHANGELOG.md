@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file. The format 
 
 ### Changed
 
+- Rename `gcp.auth.credential_file` to `gcp.auth.credentials_file`; update existing TOML configurations to use the plural key.
 - Separate provider-neutral OpenSSH key, trust-file, command, and transfer mechanics from GCP authorization and session preparation; split state and Cloud SDK path ownership and rename the Win32 process helper.
 - Run shared OpenSSH regression tests independently of GCP, with actual local key preparation on each supported platform and separately selectable Windows-specific checks.
 - Use platformdirs' user-state directory as the state-root standard; preserve explicit `PICCOLO_STATE_DIR` overrides without legacy migration tooling.

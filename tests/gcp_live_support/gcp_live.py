@@ -139,8 +139,8 @@ def run_config(
     )
     subnet_map = ", ".join(f"{quote(k)} = {quote(v)}" for k, v in g.subnets.items())
     credential = (
-        f"credential_file = {quote(str(g.auth.credential_file))}\n"
-        if g.auth.credential_file
+        f"credentials_file = {quote(str(g.auth.credentials_file))}\n"
+        if g.auth.credentials_file
         else ""
     )
     path = directory / "piccolo.toml"

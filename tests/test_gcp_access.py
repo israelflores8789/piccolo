@@ -359,7 +359,7 @@ def test_guest_account_cannot_be_sdk_provisioner(
         auth=replace(
             config.gcp.auth,
             mode="file",
-            credential_file=path,
+            credentials_file=path,
             impersonate_service_account=config.gcp.service_account
             if impersonate
             else "",
