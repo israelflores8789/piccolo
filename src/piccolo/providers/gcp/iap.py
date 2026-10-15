@@ -13,40 +13,43 @@ import threading
 
 def windows_proxy(arguments: list[str]) -> int:
     """Relay binary input and stop the SDK when OpenSSH closes its input pipe."""
-    import msvcrt
+    if sys.platform == "win32":
+        import msvcrt
 
-    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
-    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
-    closed = threading.Event()
-    with subprocess.Popen(
-        arguments,
-        shell=False,
-        stdin=subprocess.PIPE,
-        stdout=sys.stdout.buffer,
-        stderr=sys.stderr.buffer,
-        bufsize=0,
-    ) as process:
-        assert process.stdin is not None
-        destination = process.stdin.fileno()
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        closed = threading.Event()
+        with subprocess.Popen(
+            arguments,
+            shell=False,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout.buffer,
+            stderr=sys.stderr.buffer,
+            bufsize=0,
+        ) as process:
+            assert process.stdin is not None
+            destination = process.stdin.fileno()
 
-        def forward() -> None:
-            """Keep raw bytes unchanged and distinguish caller EOF from SDK failure."""
-            try:
-                while data := os.read(sys.stdin.fileno(), 65536):
-                    view = memoryview(data)
-                    while view:
-                        written = os.write(destination, view)
-                        view = view[written:]
-            except OSError:
-                return
-            closed.set()
-            if process.poll() is None:
-                process.terminate()
+            def forward() -> None:
+                """Relay raw bytes and distinguish caller EOF from SDK failure."""
+                try:
+                    while data := os.read(sys.stdin.fileno(), 65536):
+                        view = memoryview(data)
+                        while view:
+                            written = os.write(destination, view)
+                            view = view[written:]
+                except OSError:
+                    return
+                closed.set()
+                if process.poll() is None:
+                    process.terminate()
 
-        worker = threading.Thread(target=forward, daemon=True)
-        worker.start()
-        result = process.wait()
-        return 0 if closed.is_set() else result
+            worker = threading.Thread(target=forward, daemon=True)
+            worker.start()
+            result = process.wait()
+            return 0 if closed.is_set() else result
+    else:
+        raise OSError("Windows IAP proxy requires native Windows Python")
 
 
 def main() -> int:
