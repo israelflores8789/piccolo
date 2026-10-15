@@ -57,7 +57,9 @@ jobs:
       if: runner.os == 'macOS'
       run: |
         brew install coreutils
-        echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+        guest_bin="$(brew --prefix coreutils)/libexec/gnubin"
+        echo "$guest_bin" >> "$GITHUB_PATH"
+        echo "PICCOLO_GUEST_BIN=$guest_bin" >> "$GITHUB_ENV"
 
     - name: Run unit tests
       uses: pavelzw/pytest-action@v2
@@ -66,8 +68,9 @@ jobs:
         emoji: true
         job-summary: true
         report-title: "Piccolo unit tests"
-        custom-pytest: uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
-        custom-arguments: '-s -m "not gcp_live and not gcp_win_live" --junitxml=junit.xml'
+        # Restore GNU tools after the action's login shell runs its startup files.
+        custom-pytest: env PATH="${PICCOLO_GUEST_BIN:+$PICCOLO_GUEST_BIN:}$PATH" uv run --locked --with pytest-md==0.2.0 --with pytest-emoji==0.2.0 pytest
+        custom-arguments: '--capture=fd -m "not gcp_live and not gcp_win_live" --junitxml=junit.xml -o junit_logging=all -o junit_log_passing_tests=false'
 
     - name: Save JUnit test results
       if: always()

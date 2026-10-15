@@ -253,6 +253,27 @@ Hatchling builds a wheel containing runtime Python modules and required package/
 
 Native Windows live behavior and terminal acceptance require the separately approved validation described below. Offline validation does not establish Windows provisioning, bootstrap, relocation, recovery, or terminal behavior against real GCP resources.
 
+### Windows test prerequisites
+
+Run Windows tests with native Windows Python and Git for Windows. Git's `usr\bin` directory must be on `PATH` so the test helpers can discover `cygpath.exe` and use the matching Git Bash executable. Having `bash.exe` on `PATH` alone is insufficient. This is a development/test prerequisite; using the installed Piccolo CLI from PowerShell does not require `cygpath`.
+
+For a standard Git for Windows installation, run the following in PowerShell to add the directory to your user `PATH` and update the current session. Adjust `$gitTools` if Git is installed elsewhere.
+
+```powershell
+$gitTools = 'C:\Program Files\Git\usr\bin'
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $gitTools) {
+    [Environment]::SetEnvironmentVariable(
+        'Path', "$gitTools;$userPath".TrimEnd(';'), 'User'
+    )
+}
+$env:Path = "$gitTools;$env:Path"
+Get-Command cygpath
+cygpath -u $env:USERPROFILE
+```
+
+`Get-Command` should resolve to the Git installation's `usr\bin\cygpath.exe`, and `cygpath` should print your home directory as a POSIX path. Restart Windows Terminal and any editor or Codex instance that launches tests so future sessions inherit the saved user `PATH`. The commands above update the current PowerShell session immediately. See Microsoft's [PowerShell environment-variable documentation](https://github.com/MicrosoftDocs/PowerShell-Docs/blob/main/reference/7.6/Microsoft.PowerShell.Core/About/about_Environment_Variables.md) for process and persistent environment scopes.
+
 ### GCP Windows live selection
 
 The native Windows GCP suite is `tests/test_gcp_win_live.py`, marked `gcp_win_live` and selected with `--gcp-win-live` through `just test-gcp-win-live PROFILE`. It is excluded from `just test-local`, `just ci`, and CI, and cannot be combined with the POSIX `--gcp-live` selection. The same project approval digest, cumulative duration, spending ledger, manifests, and scoped janitor apply. The Windows recipe requires `PICCOLO_GCP_LIVE_BUDGET_FILE`; no live validation is authorized merely by installing Piccolo or selecting a marker.

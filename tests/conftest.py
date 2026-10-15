@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from gcp_live_support.deadline import Deadline, live_session
+from platform_support import guest_bash
 
 from piccolo.config import Config, load
 from piccolo.config.models import GCP
@@ -30,7 +31,7 @@ def gcloud_transport_backend(
     """Retain POSIX gcloud regression tests; native transport has its own suite."""
     if request.module.__name__ not in {
         "test_connection",
-        "test_security_medium",
+        "test_gcloud_connection",
         "test_ssh_expiry",
     }:
         return
@@ -309,10 +310,11 @@ class FakeCloud:
 class GuestConnection:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
+        self.bash = guest_bash()
         self.guest_home = str(directory)
         if sys.platform == "win32":
             converted = subprocess.run(
-                ["cygpath", "-u", str(directory)],
+                [str(Path(self.bash).with_name("cygpath.exe")), "-u", str(directory)],
                 text=True,
                 capture_output=True,
                 check=True,
@@ -337,7 +339,7 @@ class GuestConnection:
             raise PiccoloError(f"Connection interrupted in {zone}")
         guest_command = command.replace('"$HOME"', shlex.quote(self.guest_home))
         result = subprocess.run(
-            ["bash", "-c", guest_command],
+            [self.bash, "-x", "-c", guest_command],
             cwd=self.directory,
             text=True,
             capture_output=True,
@@ -346,7 +348,13 @@ class GuestConnection:
             env={**os.environ, "HOME": self.guest_home},
         )
         if result.returncode:
-            raise PiccoloError(result.stderr.strip())
+            raise PiccoloError(
+                f"Local guest emulation failed in {zone} (exit {result.returncode})\n"
+                f"Shell: {self.bash}\n"
+                f"Command: {guest_command}\n"
+                f"stdout: {result.stdout.strip() or '<empty>'}\n"
+                f"stderr (Bash trace):\n{result.stderr.strip() or '<empty>'}"
+            )
         return result.stdout.strip()
 
     def copy(self, zone: str, source: Path, destination: str) -> None:

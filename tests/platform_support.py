@@ -1,15 +1,33 @@
 # Copyright 2026 Israel Flores-Arbolay
 # SPDX-License-Identifier: Apache-2.0
 
-"""platform_support.py — Inspect real private permissions and test redirects."""
+"""platform_support.py — Host permissions, redirects, and guest shell selection."""
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+
+def guest_bash() -> str:
+    """Resolve the local guest shell, pairing Windows Bash with Git's cygpath."""
+    if sys.platform == "win32":
+        cygpath = shutil.which("cygpath")
+        if cygpath is None:
+            pytest.fail("Git for Windows usr/bin must be on PATH for guest emulation")
+        # A full path avoids Windows selecting the System32 WSL launcher.
+        shell = Path(cygpath).resolve().with_name("bash.exe")
+        if not shell.is_file() or not shell.with_name("msys-2.0.dll").is_file():
+            pytest.fail(f"Expected Git for Windows Bash beside {cygpath}")
+        return str(shell)
+    shell = shutil.which("bash")
+    if shell is None:
+        pytest.fail("Bash must be on PATH for local guest emulation")
+    return str(Path(shell).resolve())
 
 
 def assert_private(path: Path, *, directory: bool = False) -> None:
